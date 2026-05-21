@@ -494,6 +494,69 @@
     return { transformed, stats: { type: "quad", controlPoints: names.join(",") } };
   }
 
+  function solve3x3(matrix, vector) {
+    const a = matrix.map((row, i) => [...row, vector[i]]);
+    for (let col = 0; col < 3; col += 1) {
+      let pivot = col;
+      for (let row = col + 1; row < 3; row += 1) {
+        if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
+      }
+      if (Math.abs(a[pivot][col]) < 1e-9) return null;
+      if (pivot !== col) [a[pivot], a[col]] = [a[col], a[pivot]];
+      const div = a[col][col];
+      for (let j = col; j < 4; j += 1) a[col][j] /= div;
+      for (let row = 0; row < 3; row += 1) {
+        if (row === col) continue;
+        const factor = a[row][col];
+        for (let j = col; j < 4; j += 1) a[row][j] -= factor * a[col][j];
+      }
+    }
+    return [a[0][3], a[1][3], a[2][3]];
+  }
+
+  function centroid(values) {
+    return values.reduce((sum, value) => add(sum, value), [0, 0, 0]).map((value) => value / values.length);
+  }
+
+  function transformByAffine(points, design, measured, names) {
+    const controlNames = names.filter((name) => design[name] && measured[name]);
+    if (controlNames.length < 4) throw new Error("For få kontrollpunkter for volumtransform.");
+    const designControls = controlNames.map((name) => design[name]);
+    const measuredControls = controlNames.map((name) => measured[name]);
+    const designCenter = centroid(designControls);
+    const measuredCenter = centroid(measuredControls);
+    const normal = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const rhs = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+
+    for (let i = 0; i < controlNames.length; i += 1) {
+      const d = sub(designControls[i], designCenter);
+      const m = sub(measuredControls[i], measuredCenter);
+      for (let row = 0; row < 3; row += 1) {
+        for (let col = 0; col < 3; col += 1) normal[row][col] += d[row] * d[col];
+        for (let axis = 0; axis < 3; axis += 1) rhs[axis][row] += d[row] * m[axis];
+      }
+    }
+
+    const rows = rhs.map((vector) => solve3x3(normal, vector));
+    if (rows.some((row) => !row)) throw new Error("Kontrollpunktene er for flate for volumtransform.");
+
+    const transformed = {};
+    for (const [pointId, point] of Object.entries(points)) {
+      const rel = sub(point, designCenter);
+      transformed[pointId] = [
+        measuredCenter[0] + dot(rows[0], rel),
+        measuredCenter[1] + dot(rows[1], rel),
+        measuredCenter[2] + dot(rows[2], rel)
+      ];
+    }
+    const exactControls = new Map(controlNames.map((name) => [coordKey(design[name]), measured[name]]));
+    for (const [pointId, point] of Object.entries(points)) {
+      const exact = exactControls.get(coordKey(point));
+      if (exact) transformed[pointId] = exact;
+    }
+    return { transformed, stats: { type: "affine", controlPoints: controlNames.join(",") } };
+  }
+
   function transformByLine(points, design, measured, names) {
     const ordered = names.filter((name) => design[name] && measured[name]);
     if (ordered.length < 2) return transformByAxis(points, design, measured, ordered);
@@ -553,6 +616,13 @@
     );
     if (/ToTheLine/i.test(object.stakeoutMethod || object.props.StakeoutMethod || "")) {
       return transformByLine(brep.points, object.design, object.measured, names);
+    }
+    if (names.length >= 4) {
+      try {
+        return transformByAffine(brep.points, object.design, object.measured, names);
+      } catch (err) {
+        if (!/flate|volum/i.test(err?.message || "")) throw err;
+      }
     }
     if (names.length >= 4) return transformByQuad(brep.points, object.design, object.measured, names.slice(0, 4));
     if (names.length >= 2) return transformByAxis(brep.points, object.design, object.measured, names.slice(0, 2));

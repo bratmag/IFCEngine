@@ -186,9 +186,48 @@
 
   function parseIfcEntities(ifcText) {
     const entities = new Map();
-    for (const line of String(ifcText || "").split(/\r?\n/)) {
-      const match = line.match(/^#(\d+)=\s*(.*);\s*$/);
-      if (match) entities.set(Number(match[1]), match[2]);
+    const text = String(ifcText || "");
+    let i = 0;
+    while (i < text.length) {
+      if (text[i] !== "#") {
+        i += 1;
+        continue;
+      }
+
+      let idEnd = i + 1;
+      while (idEnd < text.length && text.charCodeAt(idEnd) >= 48 && text.charCodeAt(idEnd) <= 57) idEnd += 1;
+      if (idEnd === i + 1) {
+        i += 1;
+        continue;
+      }
+
+      let cursor = idEnd;
+      while (cursor < text.length && /\s/.test(text[cursor])) cursor += 1;
+      if (text[cursor] !== "=") {
+        i = idEnd;
+        continue;
+      }
+
+      cursor += 1;
+      while (cursor < text.length && /\s/.test(text[cursor])) cursor += 1;
+      const entityStart = cursor;
+      let inString = false;
+      while (cursor < text.length) {
+        const ch = text[cursor];
+        if (ch === "'") {
+          if (inString && text[cursor + 1] === "'") {
+            cursor += 2;
+            continue;
+          }
+          inString = !inString;
+        } else if (!inString && ch === ";") {
+          entities.set(Number(text.slice(i + 1, idEnd)), text.slice(entityStart, cursor).trim());
+          cursor += 1;
+          break;
+        }
+        cursor += 1;
+      }
+      i = cursor;
     }
     return entities;
   }
@@ -202,7 +241,49 @@
   }
 
   function refs(text) {
-    return Array.from(String(text || "").matchAll(/#(\d+)/g)).map((match) => Number(match[1]));
+    const out = [];
+    const source = String(text || "");
+    for (let i = 0; i < source.length; i += 1) {
+      if (source[i] !== "#") continue;
+      let cursor = i + 1;
+      while (cursor < source.length && source.charCodeAt(cursor) >= 48 && source.charCodeAt(cursor) <= 57) cursor += 1;
+      if (cursor > i + 1) {
+        out.push(Number(source.slice(i + 1, cursor)));
+        i = cursor - 1;
+      }
+    }
+    return out;
+  }
+
+  function readEntityLineId(line) {
+    const text = String(line || "");
+    if (text[0] !== "#") return null;
+    let cursor = 1;
+    while (cursor < text.length && text.charCodeAt(cursor) >= 48 && text.charCodeAt(cursor) <= 57) cursor += 1;
+    if (cursor === 1) return null;
+    while (cursor < text.length && /\s/.test(text[cursor])) cursor += 1;
+    if (text[cursor] !== "=") return null;
+    return Number(text.slice(1, String(line || "").indexOf("=")).trim());
+  }
+
+  function isCartesianPointLine(line) {
+    const text = String(line || "");
+    const equal = text.indexOf("=");
+    if (equal < 0) return false;
+    return text.slice(equal + 1).trimStart().toUpperCase().startsWith("IFCCARTESIANPOINT(");
+  }
+
+  function entityName(entity) {
+    const text = String(entity || "");
+    const paren = text.indexOf("(");
+    return paren > 0 ? text.slice(0, paren).toUpperCase() : "";
+  }
+
+  function productArgs(entity) {
+    const text = String(entity || "");
+    const open = text.indexOf("(");
+    if (open < 0 || !text.endsWith(")")) throw new Error(`Forventet IFC-produkt, fikk ${text.slice(0, 80)}`);
+    return splitIfcParams(text.slice(open + 1, -1));
   }
 
   function pointCoords(entity) {
@@ -216,15 +297,15 @@
     const entities = parseIfcEntities(ifcText);
     let productId = null;
     for (const [entityId, entity] of entities.entries()) {
-      if (entity.includes(`'${guid}'`) && /^IFC\w+\(/i.test(entity)) {
+      if (entity.includes(`'${guid}'`) && entityName(entity).startsWith("IFC")) {
         productId = entityId;
         break;
       }
     }
     if (productId == null) throw new Error(`Fant ikke IFC-objekt med GUID ${guid}.`);
 
-    const productArgs = splitIfcParams(entities.get(productId).replace(/^IFC\w+\(/i, "").slice(0, -1));
-    const shapeId = refs(productArgs[6] || "")[0];
+    const args = productArgs(entities.get(productId));
+    const shapeId = refs(args[6] || "")[0];
     const shapeArgs = entityArgs(entities.get(shapeId), "IFCPRODUCTDEFINITIONSHAPE");
     const shapeRepId = refs(shapeArgs[2])[0];
     const shapeRepArgs = entityArgs(entities.get(shapeRepId), "IFCSHAPEREPRESENTATION");
@@ -389,12 +470,12 @@
 
   function replaceCartesianPoints(ifcText, transformedPoints) {
     return String(ifcText || "").split(/\r?\n/).map((line) => {
-      const match = line.match(/^#(\d+)=\s*IFCCARTESIANPOINT\(\([^)]*\)\);$/);
-      if (!match) return line;
-      const point = transformedPoints[match[1]];
+      if (!isCartesianPointLine(line)) return line;
+      const id = readEntityLineId(line);
+      const point = transformedPoints[id];
       if (!point) return line;
       const mm = point.map((coord) => coord * 1000);
-      return `#${match[1]}= IFCCARTESIANPOINT((${ifcNum(mm[0])},${ifcNum(mm[1])},${ifcNum(mm[2])}));`;
+      return `#${id}= IFCCARTESIANPOINT((${ifcNum(mm[0])},${ifcNum(mm[1])},${ifcNum(mm[2])}));`;
     }).join("\n");
   }
 
@@ -470,12 +551,15 @@
 
     if (!additions.length) return ifcText;
     const replaced = String(ifcText || "").split(/\r?\n/).map((line) => {
-      const match = line.match(/^#(\d+)=\s*(.*);\s*$/);
-      if (!match) return line;
-      const replacement = replacements.get(Number(match[1]));
-      return replacement ? `#${match[1]}= ${replacement};` : line;
+      const id = readEntityLineId(line);
+      if (id == null) return line;
+      const replacement = replacements.get(id);
+      return replacement ? `#${id}= ${replacement};` : line;
     }).join("\n");
-    return replaced.replace(/ENDSEC;\s*END-ISO-10303-21;/, `${additions.join("\n")}\nENDSEC;\nEND-ISO-10303-21;`);
+    const footer = "ENDSEC;\nEND-ISO-10303-21;";
+    const footerIndex = replaced.lastIndexOf("ENDSEC;");
+    if (footerIndex < 0) return `${replaced}\n${additions.join("\n")}\n`;
+    return `${replaced.slice(0, footerIndex)}${additions.join("\n")}\n${footer}`;
   }
 
   function asBuiltName(originalName) {

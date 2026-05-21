@@ -7,7 +7,7 @@
     TOKEN_WAIT_MS: 30000,
     PROXY_URL: "/.netlify/functions/tc-proxy",
     APP_TITLE: "IFCEngine",
-    APP_BUILD: "20260521-large-ifc-nonfatal-mmi",
+    APP_BUILD: "20260521-asbuilt-units-and-idempotent-name",
     JXL_ECEF_NN2000_GEOID_OFFSET_M: 40.3703,
     AUTO_CONVERT_ON_OPEN: false,
     IFC_POINT_OBJECT_HEIGHT_M: 1,
@@ -180,6 +180,14 @@
   function getIfcFilename(filename) {
     const name = String(filename || "output.gml").trim() || "output.gml";
     return /\.(gml|jxl)$/i.test(name) ? name.replace(/\.(gml|jxl)$/i, ".ifc") : `${name}.ifc`;
+  }
+
+  function isAsBuiltIfcName(name) {
+    return /\sAS\s+BUILT(?:\sAS\s+BUILT)*\.ifc$/i.test(String(name || ""));
+  }
+
+  function originalIfcNameForAsBuilt(name) {
+    return String(name || "").replace(/(?:\s+AS\s+BUILT)+\.ifc$/i, ".ifc");
   }
 
   function getUploadTargetFile() {
@@ -1075,10 +1083,13 @@
     const engine = window.AsBuiltEngine;
     if (!engine?.parseJxl) return [];
     const parsed = engine.parseJxl(jxlText);
-    const activeNames = parsed.activeMapFiles.map((name) => String(name || "").split(/[\\/]/).pop().toLowerCase());
+    const activeNames = parsed.activeMapFiles
+      .map((name) => originalIfcNameForAsBuilt(String(name || "").split(/[\\/]/).pop()).toLowerCase());
     const candidates = (state.fileList || []).filter((file) => /\.ifc$/i.test(String(file?.name || "")));
-    if (!activeNames.length) return candidates;
-    return candidates.filter((file) => activeNames.includes(String(file.name || "").toLowerCase()));
+    const sourceCandidates = candidates.filter((file) => !isAsBuiltIfcName(file.name));
+    const preferred = sourceCandidates.length ? sourceCandidates : candidates;
+    if (!activeNames.length) return preferred;
+    return preferred.filter((file) => activeNames.includes(originalIfcNameForAsBuilt(file.name).toLowerCase()));
   }
 
   async function buildAndUploadAsBuiltFromJxl({ jxlText, jxlName, uploadFallbackParentId = null }) {

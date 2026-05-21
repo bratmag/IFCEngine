@@ -286,15 +286,98 @@
     return splitIfcParams(text.slice(open + 1, -1));
   }
 
-  function pointCoords(entity) {
+  function ifcLengthScale(entity) {
+    const text = String(entity || "").toUpperCase();
+    if (!text.startsWith("IFCSIUNIT(") || !text.includes(".LENGTHUNIT.")) return null;
+    if (text.includes(".MILLI.") && text.includes(".METRE.")) return 0.001;
+    if (text.includes(".CENTI.") && text.includes(".METRE.")) return 0.01;
+    if (text.includes(".DECI.") && text.includes(".METRE.")) return 0.1;
+    if (text.includes(".METRE.")) return 1;
+    return null;
+  }
+
+  function getIfcLengthScale(entities) {
+    for (const entity of entities.values()) {
+      if (!String(entity || "").toUpperCase().startsWith("IFCUNITASSIGNMENT(")) continue;
+      for (const unitId of refs(entity)) {
+        const scale = ifcLengthScale(entities.get(unitId));
+        if (scale) return scale;
+      }
+    }
+    for (const entity of entities.values()) {
+      const scale = ifcLengthScale(entity);
+      if (scale) return scale;
+    }
+    return 1;
+  }
+
+  function pointCoords(entity, lengthScale = 1) {
     const args = entityArgs(entity, "IFCCARTESIANPOINT");
     const nums = Array.from(args[0].matchAll(/[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?/g)).map((match) => Number(match[0]));
     if (nums.length < 3) throw new Error(`Klarte ikke lese punktkoordinat fra ${entity}`);
-    return [nums[0] / 1000, nums[1] / 1000, nums[2] / 1000];
+    return [nums[0] * lengthScale, nums[1] * lengthScale, nums[2] * lengthScale];
+  }
+
+  function directionCoords(entity, fallback) {
+    if (!entity) return fallback;
+    const args = entityArgs(entity, "IFCDIRECTION");
+    const nums = Array.from(args[0].matchAll(/[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?/g)).map((match) => Number(match[0]));
+    if (nums.length < 3) return fallback;
+    return unit([nums[0], nums[1], nums[2]]);
+  }
+
+  function placementLocalToWorld(placement, point) {
+    if (!placement) return point;
+    return add(
+      placement.worldOffset,
+      add(
+        add(mul(placement.xAxis, point[0]), mul(placement.yAxis, point[1])),
+        mul(placement.zAxis, point[2])
+      )
+    );
+  }
+
+  function placementWorldToLocal(placement, point) {
+    if (!placement) return point;
+    const rel = sub(point, placement.worldOffset);
+    return [dot(rel, placement.xAxis), dot(rel, placement.yAxis), dot(rel, placement.zAxis)];
+  }
+
+  function placementInfo(entities, placementId, lengthScale, seen = new Set()) {
+    if (!placementId || seen.has(placementId)) return null;
+    seen.add(placementId);
+    const placement = entities.get(placementId);
+    if (!placement || !entityName(placement).startsWith("IFCLOCALPLACEMENT")) return null;
+
+    const args = entityArgs(placement, "IFCLOCALPLACEMENT");
+    const parentId = refs(args[0])[0] || null;
+    const axisPlacementId = refs(args[1])[0] || null;
+    const axisPlacement = entities.get(axisPlacementId);
+    if (!axisPlacement || !entityName(axisPlacement).startsWith("IFCAXIS2PLACEMENT3D")) return null;
+
+    const axisArgs = entityArgs(axisPlacement, "IFCAXIS2PLACEMENT3D");
+    const locationId = refs(axisArgs[0])[0] || null;
+    const localOffset = pointCoords(entities.get(locationId), lengthScale);
+    const zAxis = directionCoords(entities.get(refs(axisArgs[1])[0]), [0, 0, 1]);
+    const xAxis = projectedAxis(directionCoords(entities.get(refs(axisArgs[2])[0]), [1, 0, 0]), zAxis);
+    const yAxis = cross(zAxis, xAxis);
+    const parent = placementInfo(entities, parentId, lengthScale, seen);
+    const parentOffset = parent?.worldOffset || [0, 0, 0];
+    return {
+      placementId,
+      locationId,
+      localOffset,
+      parentOffset,
+      worldOffset: add(parentOffset, localOffset),
+      xAxis,
+      yAxis,
+      zAxis
+    };
   }
 
   function extractBrep(ifcText, guid) {
     const entities = parseIfcEntities(ifcText);
+    const lengthScale = getIfcLengthScale(entities);
     let productId = null;
     for (const [entityId, entity] of entities.entries()) {
       if (entity.includes(`'${guid}'`) && entityName(entity).startsWith("IFC")) {
@@ -305,6 +388,7 @@
     if (productId == null) throw new Error(`Fant ikke IFC-objekt med GUID ${guid}.`);
 
     const args = productArgs(entities.get(productId));
+    const placement = placementInfo(entities, refs(args[5] || "")[0], lengthScale);
     const shapeId = refs(args[6] || "")[0];
     const shapeArgs = entityArgs(entities.get(shapeId), "IFCPRODUCTDEFINITIONSHAPE");
     const shapeRepId = refs(shapeArgs[2])[0];
@@ -326,8 +410,18 @@
     }
 
     const points = {};
-    for (const pointId of pointIds) points[pointId] = pointCoords(entities.get(pointId));
-    return { productId, points };
+    for (const pointId of pointIds) {
+      const localPoint = pointCoords(entities.get(pointId), lengthScale);
+      points[pointId] = placementLocalToWorld(placement, localPoint);
+    }
+    if (placement?.locationId) points[placement.locationId] = placement.worldOffset;
+    return {
+      productId,
+      points,
+      geometryPointIds: Array.from(pointIds),
+      placement,
+      lengthScale
+    };
   }
 
   const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -468,14 +562,14 @@
     return Number(value).toFixed(6).replace(/0+$/, "").replace(/\.$/, "") || "0";
   }
 
-  function replaceCartesianPoints(ifcText, transformedPoints) {
+  function replaceCartesianPoints(ifcText, transformedPoints, lengthScale = 1) {
     return String(ifcText || "").split(/\r?\n/).map((line) => {
       if (!isCartesianPointLine(line)) return line;
       const id = readEntityLineId(line);
       const point = transformedPoints[id];
       if (!point) return line;
-      const mm = point.map((coord) => coord * 1000);
-      return `#${id}= IFCCARTESIANPOINT((${ifcNum(mm[0])},${ifcNum(mm[1])},${ifcNum(mm[2])}));`;
+      const fileCoords = point.map((coord) => coord / lengthScale);
+      return `#${id}= IFCCARTESIANPOINT((${ifcNum(fileCoords[0])},${ifcNum(fileCoords[1])},${ifcNum(fileCoords[2])}));`;
     }).join("\n");
   }
 
@@ -563,7 +657,9 @@
   }
 
   function asBuiltName(originalName) {
-    return String(originalName || "model.ifc").replace(/\.ifc$/i, " AS BUILT.ifc");
+    return String(originalName || "model.ifc")
+      .replace(/(?:\s+AS\s+BUILT)+\.ifc$/i, ".ifc")
+      .replace(/\.ifc$/i, " AS BUILT.ifc");
   }
 
   function buildAsBuiltIfc({ jxlText, ifcText, ifcName }) {
@@ -583,8 +679,26 @@
       try {
         const brep = extractBrep(output, object.guid);
         const transform = selectTransform(object, brep);
-        output = replaceCartesianPoints(output, transform.transformed);
-        const objectStats = { guid: object.guid, ...transform.stats };
+        const transformed = { ...transform.transformed };
+        if (brep.placement?.locationId && transformed[brep.placement.locationId]) {
+          const transformedPlacementWorld = transformed[brep.placement.locationId];
+          transformed[brep.placement.locationId] = sub(transformedPlacementWorld, brep.placement.parentOffset);
+          for (const pointId of brep.geometryPointIds || []) {
+            if (transformed[pointId]) {
+              transformed[pointId] = placementWorldToLocal(
+                { ...brep.placement, worldOffset: transformedPlacementWorld },
+                transformed[pointId]
+              );
+            }
+          }
+        }
+        output = replaceCartesianPoints(output, transformed, brep.lengthScale);
+        const objectStats = {
+          guid: object.guid,
+          lengthScale: brep.lengthScale,
+          placement: brep.placement ? "local" : "none",
+          ...transform.stats
+        };
         try {
           output = setProductMmi(output, object.guid, "500");
         } catch (err) {

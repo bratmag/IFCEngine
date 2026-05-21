@@ -7,7 +7,7 @@
     TOKEN_WAIT_MS: 30000,
     PROXY_URL: "/.netlify/functions/tc-proxy",
     APP_TITLE: "IFCEngine",
-    APP_BUILD: "20260521-ifcengine-initial",
+    APP_BUILD: "20260521-asbuilt-engine",
     JXL_ECEF_NN2000_GEOID_OFFSET_M: 40.3703,
     AUTO_CONVERT_ON_OPEN: false,
     IFC_POINT_OBJECT_HEIGHT_M: 1,
@@ -938,6 +938,91 @@
     }
 
     return proxyRes.json;
+  }
+
+  async function downloadProjectFile(file) {
+    const proxyRes = await callProxy("downloadKofFile", {
+      token: state.accessToken,
+      projectId: state.project.id,
+      projectLocation: state.project.location,
+      fileId: file.id,
+      fileName: file.name
+    });
+
+    if (!proxyRes.ok || !proxyRes.json) throw new Error(`Proxy svarte med HTTP ${proxyRes.status}`);
+    const result = proxyRes.json;
+    if (!result.ok) throw new Error(result.error || result.step || `Kunne ikke laste ned ${file.name}`);
+    return result;
+  }
+
+  function findAsBuiltSourceModels(jxlText) {
+    const engine = window.AsBuiltEngine;
+    if (!engine?.parseJxl) return [];
+    const parsed = engine.parseJxl(jxlText);
+    const activeNames = parsed.activeMapFiles.map((name) => String(name || "").split(/[\\/]/).pop().toLowerCase());
+    const candidates = (state.fileList || []).filter((file) => /\.ifc$/i.test(String(file?.name || "")));
+    if (!activeNames.length) return candidates;
+    return candidates.filter((file) => activeNames.includes(String(file.name || "").toLowerCase()));
+  }
+
+  async function buildAndUploadAsBuiltFromJxl({ jxlText, jxlName, uploadFallbackParentId = null }) {
+    const engine = window.AsBuiltEngine;
+    if (!engine?.buildAsBuiltIfc) throw new Error("As built-motoren er ikke lastet.");
+
+    const sourceModels = findAsBuiltSourceModels(jxlText);
+    if (!sourceModels.length) {
+      throw new Error("Fant ingen original IFC-modell i prosjektlisten som matcher JXL ActiveMapFiles.");
+    }
+
+    const outputs = [];
+    for (const modelFile of sourceModels) {
+      setStatus(`Bygger AS BUILT for ${modelFile.name}...`, "working");
+      const original = await downloadProjectFile(modelFile);
+      const asBuilt = engine.buildAsBuiltIfc({
+        jxlText,
+        ifcText: original.text || "",
+        ifcName: original.file?.name || modelFile.name
+      });
+      if (!asBuilt.ok) {
+        outputs.push({
+          ok: false,
+          sourceModel: modelFile.name,
+          outName: asBuilt.outName,
+          asBuilt,
+          uploadResult: { ok: false, skipped: true, error: "Ingen berørte GUID-er ble oppdatert." }
+        });
+        continue;
+      }
+
+      const sourceFile = {
+        ...(original.file || modelFile),
+        parentId: original.file?.parentId || modelFile.parentId || uploadFallbackParentId,
+        name: original.file?.name || modelFile.name,
+        path: modelFile.path || "IFC-modell"
+      };
+      const uploadResult = await uploadConvertedTxtToProject({
+        sourceFile,
+        outName: asBuilt.outName,
+        txt: asBuilt.text
+      });
+      outputs.push({
+        ok: uploadResult.ok,
+        sourceModel: modelFile.name,
+        outName: asBuilt.outName,
+        size: asBuilt.text.length,
+        asBuilt,
+        uploadResult
+      });
+      if (uploadResult.ok) markFileConverted(modelFile, asBuilt.outName);
+      else triggerDownload(asBuilt.outName, asBuilt.text);
+    }
+
+    return {
+      ok: outputs.some((output) => output.ok),
+      jxlName,
+      sourceModels: sourceModels.map((file) => file.name),
+      outputs
+    };
   }
 
   function convertKofToTxt(kofText) {
@@ -3244,18 +3329,7 @@
   }
 
   async function downloadAndConvertFile(file) {
-    const proxyRes = await callProxy("downloadKofFile", {
-      token: state.accessToken,
-      projectId: state.project.id,
-      projectLocation: state.project.location,
-      fileId: file.id,
-      fileName: file.name
-    });
-
-    if (!proxyRes.ok || !proxyRes.json) throw new Error(`Proxy svarte med HTTP ${proxyRes.status}`);
-    const result = proxyRes.json;
-    if (!result.ok) throw new Error(result.error || result.step || "Kunne ikke laste ned kildefil");
-
+    const result = await downloadProjectFile(file);
     const converted = convertKofFile(result.text || "", result.file?.name || file.name || "output.kof");
     return { ...converted, result };
   }
@@ -3456,36 +3530,31 @@
       }
 
       const jxlName = result.jxlFile?.fileName || `${jobName}.jxl`;
-      setStatus(`Konverterer Field Data JXL: ${jxlName}...`, "working");
-      const converted = convertKofFile(result.text || "", jxlName);
-      const outName = getIfcFilename(jxlName);
-      state.lastDownloadName = outName;
+      setStatus(`Lager full AS BUILT IFC fra Field Data JXL: ${jxlName}...`, "working");
+      if (!state.fileList.length) await refreshKofList();
+      const asBuiltResult = await buildAndUploadAsBuiltFromJxl({
+        jxlText: result.text || "",
+        jxlName,
+        uploadFallbackParentId: result.uploadParentId || null
+      });
+      const okOutputs = asBuiltResult.outputs.filter((output) => output.uploadResult?.ok);
+      const downloadedOutputs = asBuiltResult.outputs.filter((output) => !output.uploadResult?.ok && output.asBuilt?.ok);
+      const failedOutputs = asBuiltResult.outputs.filter((output) => !output.asBuilt?.ok);
+      const firstOutput = asBuiltResult.outputs[0] || null;
+      state.lastDownloadName = firstOutput?.outName || null;
+      state.lastResult = { file: { name: jxlName, parentId: result.uploadParentId || null, path: "Field Data" }, text: result.text || "" };
+      state.lastUploadResult = asBuiltResult;
 
-      const sourceFile = {
-        id: result.jxlFile?.id || result.job?.id || "field-data-jxl",
-        name: jxlName,
-        parentId: result.uploadParentId || null,
-        path: "Field Data"
-      };
-      state.lastResult = { file: sourceFile, text: result.text || "" };
-
-      let uploadResult = { ok: false, skipped: true, error: "Fant ikke prosjektmappe for automatisk opplasting." };
-      if (result.uploadParentId) {
-        uploadResult = await uploadConvertedTxtToProject({
-          sourceFile,
-          outName,
-          txt: converted.text
-        });
-      }
-      state.lastUploadResult = uploadResult;
-
-      if (uploadResult.ok) {
-        setStatus(`Ferdig: ${outName} er lastet opp til prosjektet`, "success");
-        showHint(buildConversionHint({ ...converted, outName }, uploadResult));
+      renderFileList();
+      if (okOutputs.length) {
+        setStatus(`Ferdig: ${okOutputs.length} AS BUILT-modell${okOutputs.length === 1 ? "" : "er"} lastet opp`, "success");
+        showHint(`Oppdaterte GUID-er: ${escapeHtml(okOutputs.flatMap((output) => output.asBuilt.transformedGuids).join(", "))}`);
+      } else if (downloadedOutputs.length) {
+        setStatus(`Ferdig: ${downloadedOutputs.length} AS BUILT-modell${downloadedOutputs.length === 1 ? "" : "er"} lastet ned lokalt`, "success");
+        showHint("Automatisk opplasting feilet, men IFC-kopien ble laget lokalt.");
       } else {
-        triggerDownload(outName, converted.text);
-        setStatus(`Ferdig: ${outName} er lastet ned lokalt`, "success");
-        showHint(buildConversionHint({ ...converted, outName }, uploadResult));
+        setStatus("Ingen AS BUILT-objekter ble oppdatert", "error");
+        showHint(failedOutputs.map((output) => `${escapeHtml(output.sourceModel)}: ${escapeHtml(output.asBuilt?.errors?.[0]?.error || "ingen treff")}`).join("<br>"));
       }
 
       setDebug({
@@ -3495,8 +3564,7 @@
         uploadParentId: result.uploadParentId,
         uploadParentSource: result.uploadParentSource,
         appBuild: CONFIG.APP_BUILD,
-        convertedFile: { name: outName, format: converted.format, size: converted.text.length, stats: converted.stats || null },
-        uploadResult,
+        asBuiltResult,
         diagnostics: result.diagnostics
       });
     } catch (err) {
@@ -3663,6 +3731,30 @@
 
       setStatus(`Konverterer lokal fil ${file.name}...`, "working");
       const kofText = await readSourceFileText(file);
+      if (/\.jxl$/i.test(file.name || "") && window.AsBuiltEngine?.buildAsBuiltIfc) {
+        if (!state.fileList.length) await refreshKofList();
+        const asBuiltResult = await buildAndUploadAsBuiltFromJxl({
+          jxlText: kofText || "",
+          jxlName: file.name || "lokal.jxl"
+        });
+        const uploaded = asBuiltResult.outputs.filter((output) => output.uploadResult?.ok).length;
+        const local = asBuiltResult.outputs.filter((output) => !output.uploadResult?.ok && output.asBuilt?.ok).length;
+        state.lastUploadResult = asBuiltResult;
+        setStatus(
+          uploaded
+            ? `Ferdig: ${uploaded} AS BUILT-modell${uploaded === 1 ? "" : "er"} lastet opp`
+            : `Ferdig: ${local} AS BUILT-modell${local === 1 ? "" : "er"} lastet ned lokalt`,
+          "success"
+        );
+        showHint(`Lokal JXL er behandlet mot IFC-modellene i prosjektet. Oppdaterte GUID-er: ${escapeHtml(asBuiltResult.outputs.flatMap((output) => output.asBuilt?.transformedGuids || []).join(", "))}`);
+        setDebug({
+          action: "processLocalJxlAsBuilt",
+          sourceFile: { name: file.name, size: file.size, type: file.type },
+          asBuiltResult
+        });
+        return;
+      }
+
       const converted = convertKofFile(kofText || "", file.name || "output.kof");
       const outName = converted.outName;
       state.lastDownloadName = outName;

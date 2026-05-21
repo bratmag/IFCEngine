@@ -7,7 +7,7 @@
     TOKEN_WAIT_MS: 30000,
     PROXY_URL: "/.netlify/functions/tc-proxy",
     APP_TITLE: "IFCEngine",
-    APP_BUILD: "20260521-large-ifc-direct-transfer",
+    APP_BUILD: "20260521-large-ifc-line-safe-asbuilt",
     JXL_ECEF_NN2000_GEOID_OFFSET_M: 40.3703,
     AUTO_CONVERT_ON_OPEN: false,
     IFC_POINT_OBJECT_HEIGHT_M: 1,
@@ -75,6 +75,41 @@
   function setDebug(data) {
     if (!ui.debugOutput) return;
     ui.debugOutput.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  }
+
+  function summarizeAsBuiltResult(result) {
+    if (!result) return null;
+    return {
+      ok: !!result.ok,
+      jxlName: result.jxlName,
+      sourceModels: result.sourceModels || [],
+      outputs: (result.outputs || []).map((output) => ({
+        ok: !!output.ok,
+        sourceModel: output.sourceModel,
+        outName: output.outName,
+        size: output.size || output.asBuilt?.text?.length || 0,
+        asBuilt: output.asBuilt ? {
+          ok: !!output.asBuilt.ok,
+          outName: output.asBuilt.outName,
+          textSize: output.asBuilt.text?.length || 0,
+          activeMapFiles: output.asBuilt.activeMapFiles || [],
+          transformedGuids: output.asBuilt.transformedGuids || [],
+          errors: output.asBuilt.errors || [],
+          stats: output.asBuilt.stats || []
+        } : null,
+        uploadResult: output.uploadResult ? {
+          ok: !!output.uploadResult.ok,
+          skipped: !!output.uploadResult.skipped,
+          error: output.uploadResult.error || null,
+          status: output.uploadResult.status || null,
+          file: output.uploadResult.file ? {
+            id: output.uploadResult.file.id,
+            name: output.uploadResult.file.name,
+            size: output.uploadResult.file.size
+          } : null
+        } : null
+      }))
+    };
   }
 
   function setBusy(busy) {
@@ -3645,7 +3680,7 @@
         uploadParentId: result.uploadParentId,
         uploadParentSource: result.uploadParentSource,
         appBuild: CONFIG.APP_BUILD,
-        asBuiltResult,
+        asBuiltResult: summarizeAsBuiltResult(asBuiltResult),
         diagnostics: result.diagnostics
       });
     } catch (err) {
@@ -3831,7 +3866,7 @@
         setDebug({
           action: "processLocalJxlAsBuilt",
           sourceFile: { name: file.name, size: file.size, type: file.type },
-          asBuiltResult
+          asBuiltResult: summarizeAsBuiltResult(asBuiltResult)
         });
         return;
       }

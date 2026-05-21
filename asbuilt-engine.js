@@ -186,9 +186,10 @@
 
   function parseIfcEntities(ifcText) {
     const entities = new Map();
-    const pattern = /^#(\d+)=\s*(.*);\s*$/gm;
-    let match;
-    while ((match = pattern.exec(ifcText))) entities.set(Number(match[1]), match[2]);
+    for (const line of String(ifcText || "").split(/\r?\n/)) {
+      const match = line.match(/^#(\d+)=\s*(.*);\s*$/);
+      if (match) entities.set(Number(match[1]), match[2]);
+    }
     return entities;
   }
 
@@ -387,12 +388,14 @@
   }
 
   function replaceCartesianPoints(ifcText, transformedPoints) {
-    return ifcText.replace(/^#(\d+)=\s*IFCCARTESIANPOINT\(\([^)]*\)\);/gm, (line, id) => {
-      const point = transformedPoints[id];
+    return String(ifcText || "").split(/\r?\n/).map((line) => {
+      const match = line.match(/^#(\d+)=\s*IFCCARTESIANPOINT\(\([^)]*\)\);$/);
+      if (!match) return line;
+      const point = transformedPoints[match[1]];
       if (!point) return line;
       const mm = point.map((coord) => coord * 1000);
-      return `#${id}= IFCCARTESIANPOINT((${ifcNum(mm[0])},${ifcNum(mm[1])},${ifcNum(mm[2])}));`;
-    });
+      return `#${match[1]}= IFCCARTESIANPOINT((${ifcNum(mm[0])},${ifcNum(mm[1])},${ifcNum(mm[2])}));`;
+    }).join("\n");
   }
 
   function guidFromSeed(seed) {
@@ -416,7 +419,6 @@
   }
 
   function setProductMmi(ifcText, productGuid, value = "500") {
-    const entityPattern = /^#(\d+)=\s*(.*);\s*$/gm;
     const entities = parseIfcEntities(ifcText);
     let productId = null;
     for (const [entityId, entity] of entities.entries()) {
@@ -467,10 +469,12 @@
     }
 
     if (!additions.length) return ifcText;
-    const replaced = ifcText.replace(entityPattern, (line, id) => {
-      const replacement = replacements.get(Number(id));
-      return replacement ? `#${id}= ${replacement};` : line;
-    });
+    const replaced = String(ifcText || "").split(/\r?\n/).map((line) => {
+      const match = line.match(/^#(\d+)=\s*(.*);\s*$/);
+      if (!match) return line;
+      const replacement = replacements.get(Number(match[1]));
+      return replacement ? `#${match[1]}= ${replacement};` : line;
+    }).join("\n");
     return replaced.replace(/ENDSEC;\s*END-ISO-10303-21;/, `${additions.join("\n")}\nENDSEC;\nEND-ISO-10303-21;`);
   }
 

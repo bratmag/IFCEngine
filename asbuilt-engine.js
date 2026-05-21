@@ -77,6 +77,7 @@
 
     const objects = new Map();
     const pointRecordsByGuid = new Map();
+    let recordOrder = 0;
 
     for (const record of Array.from(doc.querySelectorAll("*")).filter((node) => localName(node) === "PointRecord")) {
       const props = collectProps(record);
@@ -89,7 +90,7 @@
       if (!pointRecordsByGuid.has(guid)) pointRecordsByGuid.set(guid, new Map());
       const byName = pointRecordsByGuid.get(guid);
       if (!byName.has(name)) byName.set(name, []);
-      byName.get(name).push({ name, coord, props });
+      byName.get(name).push({ name, coord, props, order: recordOrder++ });
     }
 
     for (const point of Array.from(doc.querySelectorAll("*")).filter((node) => localName(node) === "Point")) {
@@ -103,6 +104,7 @@
           guid,
           design: {},
           measured: {},
+          controlMeta: {},
           props: {},
           pointOrder: [],
           activeMapFiles: [...activeMapFiles],
@@ -122,6 +124,7 @@
           guid,
           design: {},
           measured: {},
+          controlMeta: {},
           props: {},
           pointOrder: [],
           activeMapFiles: [...activeMapFiles],
@@ -143,6 +146,11 @@
         const measured = [...records].reverse().find((record) => isMeasuredRecord(record)) || records[records.length - 1];
         if (!object.design[name] && design) object.design[name] = design.coord;
         object.measured[name] = measured.coord;
+        object.controlMeta[name] = {
+          designOrder: design?.order ?? null,
+          measuredOrder: measured?.order ?? null,
+          rawName: measured.rawName || measured.name || name
+        };
         object.props = { ...object.props, ...measured.props };
         if (!object.pointOrder.includes(name)) object.pointOrder.push(name);
       }
@@ -157,6 +165,7 @@
           guid,
           design: {},
           measured: {},
+          controlMeta: {},
           props: {},
           pointOrder: [],
           activeMapFiles: [...activeMapFiles],
@@ -513,12 +522,15 @@
     return point ? point.map((value) => Number(value).toFixed(4)).join("|") : "";
   }
 
-  function collapseDuplicateDesignPoints(names, design) {
+  function collapseDuplicateDesignPoints(names, design, controlMeta = {}) {
     const byDesign = new Map();
     for (const name of names) {
       const key = coordKey(design[name]);
       if (!key) continue;
-      byDesign.set(key, name);
+      const current = byDesign.get(key);
+      const nextOrder = controlMeta[name]?.measuredOrder ?? -1;
+      const currentOrder = current ? (controlMeta[current]?.measuredOrder ?? -1) : -1;
+      if (!current || nextOrder >= currentOrder) byDesign.set(key, name);
     }
     return Array.from(byDesign.values());
   }
@@ -526,7 +538,8 @@
   function selectTransform(object, brep) {
     const names = collapseDuplicateDesignPoints(
       object.pointOrder.filter((name) => object.design[name] && object.measured[name]),
-      object.design
+      object.design,
+      object.controlMeta
     );
     if (/ToTheLine/i.test(object.stakeoutMethod || object.props.StakeoutMethod || "")) {
       return transformByLine(brep.points, object.design, object.measured, names);

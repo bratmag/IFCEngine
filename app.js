@@ -7,7 +7,7 @@
     TOKEN_WAIT_MS: 30000,
     PROXY_URL: "/.netlify/functions/tc-proxy",
     APP_TITLE: "IFCEngine",
-    APP_BUILD: "20260521-asbuilt-duplicate-design-collapse",
+    APP_BUILD: "20260521-asbuilt-latest-stakeout-no-autodownload",
     JXL_ECEF_NN2000_GEOID_OFFSET_M: 40.3703,
     AUTO_CONVERT_ON_OPEN: false,
     IFC_POINT_OBJECT_HEIGHT_M: 1,
@@ -1141,7 +1141,6 @@
         uploadResult
       });
       if (uploadResult.ok) markFileConverted(modelFile, asBuilt.outName);
-      else triggerDownload(asBuilt.outName, asBuilt.text);
     }
 
     return {
@@ -3677,8 +3676,8 @@
         setStatus(`Ferdig: ${okOutputs.length} AS BUILT-modell${okOutputs.length === 1 ? "" : "er"} lastet opp`, "success");
         showHint(`Oppdaterte GUID-er: ${escapeHtml(okOutputs.flatMap((output) => output.asBuilt.transformedGuids).join(", "))}`);
       } else if (downloadedOutputs.length) {
-        setStatus(`Ferdig: ${downloadedOutputs.length} AS BUILT-modell${downloadedOutputs.length === 1 ? "" : "er"} lastet ned lokalt`, "success");
-        showHint("Automatisk opplasting feilet, men IFC-kopien ble laget lokalt.");
+        setStatus(`AS BUILT ble laget, men ikke lastet opp`, "error");
+        showHint("Automatisk opplasting feilet. Lokal nedlasting er ikke startet automatisk.");
       } else {
         setStatus("Ingen AS BUILT-objekter ble oppdatert", "error");
         showHint(failedOutputs.map((output) => `${escapeHtml(output.sourceModel)}: ${escapeHtml(output.asBuilt?.errors?.[0]?.error || "ingen treff")}`).join("<br>"));
@@ -3870,8 +3869,8 @@
         setStatus(
           uploaded
             ? `Ferdig: ${uploaded} AS BUILT-modell${uploaded === 1 ? "" : "er"} lastet opp`
-            : `Ferdig: ${local} AS BUILT-modell${local === 1 ? "" : "er"} lastet ned lokalt`,
-          "success"
+            : `AS BUILT ble laget, men ikke lastet opp`,
+          uploaded ? "success" : "error"
         );
         showHint(`Lokal JXL er behandlet mot IFC-modellene i prosjektet. Oppdaterte GUID-er: ${escapeHtml(asBuiltResult.outputs.flatMap((output) => output.asBuilt?.transformedGuids || []).join(", "))}`);
         setDebug({

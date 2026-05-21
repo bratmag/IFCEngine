@@ -16,6 +16,8 @@ exports.handler = async function handler(event) {
     if (action === "downloadKofFile") return await handleDownloadKofFile(body);
     if (action === "probeCore") return await handleProbeCore(body);
     if (action === "uploadConvertedTxt") return await handleUploadConvertedTxt(body);
+    if (action === "initSignedUpload") return jsonResponse(200, await handleInitSignedUpload(body));
+    if (action === "completeSignedUpload") return jsonResponse(200, await handleCompleteSignedUpload(body));
     if (action === "uploadWorldFile") return jsonResponse(200, await handleUploadWorldFile(body));
     if (action === "getFieldDataJxl") return await handleGetFieldDataJxl(body);
     if (action === "listJxlSources") return await handleListJxlSources(body);
@@ -348,7 +350,7 @@ async function getFileVersions({ token, projectLocation, fileId }) {
   };
 }
 
-async function tryCoreCandidates({ token, projectLocation, fileId, versionId }) {
+async function tryCoreCandidates({ token, projectLocation, fileId, versionId, signedUrlOnly = false }) {
   const base = await getCoreBaseUrlAsync(projectLocation);
   const candidates = [
     {
@@ -393,6 +395,18 @@ async function tryCoreCandidates({ token, projectLocation, fileId, versionId }) 
       });
 
       if (signedUrl) {
+        if (signedUrlOnly) {
+          return {
+            ok: true,
+            source: candidate.name,
+            mode: "signedUrlOnly",
+            signedUrl,
+            signedUrlHost: safeHost(signedUrl),
+            diagnostics,
+            contentType: res.contentType
+          };
+        }
+
         const fileRes = await fetchTextNoAuth(signedUrl);
 
         if (fileRes.ok) {
@@ -445,7 +459,7 @@ async function tryCoreCandidates({ token, projectLocation, fileId, versionId }) 
 }
 
 async function handleDownloadKofFile(body) {
-  const { token, projectId, projectLocation, fileId, fileName } = body;
+  const { token, projectId, projectLocation, fileId, fileName, signedUrlOnly } = body;
 
   if (!token || !fileId) {
     return jsonResponse(400, { ok: false, error: "Mangler token eller fileId" });
@@ -477,7 +491,8 @@ async function handleDownloadKofFile(body) {
     token,
     projectLocation,
     fileId,
-    versionId
+    versionId,
+    signedUrlOnly: Boolean(signedUrlOnly)
   });
 
   if (!download.ok) {
@@ -510,6 +525,7 @@ async function handleDownloadKofFile(body) {
       signedUrlHost: download.signedUrlHost || null
     },
     contentType: download.contentType,
+    downloadUrl: download.signedUrl || null,
     text: download.text
   });
 }
@@ -1033,6 +1049,123 @@ async function handleUploadConvertedTxt(body) {
     },
     attempts
   });
+}
+
+async function handleInitSignedUpload(body) {
+  const { token, projectId, projectLocation, parentId, fileName, size } = body;
+
+  if (!token || !projectId || !parentId || !fileName) {
+    return {
+      ok: false,
+      error: "Mangler token, projectId, parentId eller fileName"
+    };
+  }
+
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const initUrl = `${base}/files/fs/upload?parentId=${encodeURIComponent(parentId)}&parentType=FOLDER`;
+  const init = await fetchWithBearer(initUrl, token, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ name: fileName })
+  });
+
+  const uploadId = init.json?.uploadId || init.json?.id || init.json?.data?.uploadId || init.json?.result?.uploadId;
+  const uploadUrl =
+    init.json?.contents?.[0]?.url ||
+    init.json?.data?.contents?.[0]?.url ||
+    init.json?.result?.contents?.[0]?.url ||
+    init.json?.uploadUrl ||
+    init.json?.url;
+
+  if (!init.ok || !uploadId || !uploadUrl) {
+    return {
+      ok: false,
+      action: "initSignedUpload",
+      error: "Kunne ikke starte signed upload.",
+      project: { id: projectId, location: projectLocation },
+      upload: { parentId, fileName, size: size || null },
+      init: {
+        ok: init.ok,
+        status: init.status,
+        preview: shortText(init.text, 800)
+      }
+    };
+  }
+
+  return {
+    ok: true,
+    action: "initSignedUpload",
+    project: { id: projectId, location: projectLocation },
+    upload: {
+      parentId,
+      fileName,
+      size: size || null,
+      uploadId,
+      uploadUrl,
+      uploadUrlHost: safeHost(uploadUrl)
+    }
+  };
+}
+
+async function handleCompleteSignedUpload(body) {
+  const { token, projectId, projectLocation, parentId, fileName, size, uploadId, digest } = body;
+
+  if (!token || !projectId || !uploadId) {
+    return {
+      ok: false,
+      error: "Mangler token, projectId eller uploadId"
+    };
+  }
+
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const completeUrl = `${base}/files/fs/upload/${encodeURIComponent(uploadId)}/complete`;
+  const attempts = [];
+  const completeBodies = [
+    { label: "format-singlepart", body: { format: "SINGLEPART" } },
+    { label: "type-singlepart", body: { type: "SINGLEPART" } },
+    { label: "empty-json", body: {} },
+    { label: "no-body", body: undefined }
+  ];
+
+  for (const candidate of completeBodies) {
+    const headers = { "Content-Type": "application/json" };
+    if (digest) headers.Digest = digest;
+
+    const complete = await fetchWithBearer(completeUrl, token, {
+      method: "POST",
+      headers,
+      body: candidate.body === undefined ? undefined : JSON.stringify(candidate.body)
+    });
+    attempts.push({
+      mode: `signed-complete-${candidate.label}`,
+      url: completeUrl,
+      ok: complete.ok,
+      status: complete.status,
+      preview: shortText(complete.text, 500)
+    });
+
+    if (complete.ok || isUploadAlreadyCompleted(complete)) {
+      return {
+        ok: true,
+        action: "completeSignedUpload",
+        project: { id: projectId, location: projectLocation },
+        upload: { parentId: parentId || null, fileName: fileName || null, size: size || null, uploadId },
+        complete: complete.json || safeJsonParse(complete.text) || shortText(complete.text, 800),
+        attempts
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    action: "completeSignedUpload",
+    error: "Filinnholdet ble lastet opp, men fullføring feilet.",
+    project: { id: projectId, location: projectLocation },
+    upload: { parentId: parentId || null, fileName: fileName || null, size: size || null, uploadId },
+    attempts
+  };
 }
 
 async function handleUploadWorldFile(body) {

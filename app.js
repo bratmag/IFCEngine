@@ -7,7 +7,7 @@
     TOKEN_WAIT_MS: 30000,
     PROXY_URL: "/.netlify/functions/tc-proxy",
     APP_TITLE: "IFCEngine",
-    APP_BUILD: "20260521-asbuilt-engine",
+    APP_BUILD: "20260521-large-ifc-direct-transfer",
     JXL_ECEF_NN2000_GEOID_OFFSET_M: 40.3703,
     AUTO_CONVERT_ON_OPEN: false,
     IFC_POINT_OBJECT_HEIGHT_M: 1,
@@ -15,7 +15,8 @@
     IFC_REFERENCE_LINE_RADIUS_M: 0.015,
     IFC_REFERENCE_POINT_SIZE_M: 0.08,
     MENU_MAIN_COMMAND: "IFCENGINE_MAIN",
-    MENU_OPEN_COMMAND: "IFCENGINE_OPEN"
+    MENU_OPEN_COMMAND: "IFCENGINE_OPEN",
+    LARGE_FILE_DIRECT_BYTES: 4 * 1024 * 1024
   };
 
   const state = {
@@ -919,6 +920,11 @@
       };
     }
 
+    const size = new TextEncoder().encode(String(txt || "")).length;
+    if (size > CONFIG.LARGE_FILE_DIRECT_BYTES) {
+      return uploadLargeTextToProject({ sourceFile, outName, txt, size });
+    }
+
     const proxyRes = await callProxy("uploadConvertedTxt", {
       token: state.accessToken,
       projectId: state.project.id,
@@ -940,18 +946,93 @@
     return proxyRes.json;
   }
 
+  async function uploadLargeTextToProject({ sourceFile, outName, txt, size }) {
+    const parentId = sourceFile?.parentId || null;
+    const initRes = await callProxy("initSignedUpload", {
+      token: state.accessToken,
+      projectId: state.project.id,
+      projectLocation: state.project.location,
+      parentId,
+      fileName: outName,
+      size
+    });
+
+    if (!initRes.ok || !initRes.json?.ok) {
+      return {
+        ok: false,
+        error: initRes.json?.error || `Kunne ikke starte direkte opplasting (HTTP ${initRes.status})`,
+        details: initRes.json || shortText(initRes.text, 800)
+      };
+    }
+
+    const uploadUrl = initRes.json.upload?.uploadUrl;
+    const uploadId = initRes.json.upload?.uploadId;
+    if (!uploadUrl || !uploadId) {
+      return { ok: false, error: "Signed upload manglet uploadUrl eller uploadId.", details: initRes.json };
+    }
+
+    const upload = await fetch(uploadUrl, {
+      method: "PUT",
+      body: new Blob([txt], { type: "application/x-step;charset=utf-8" })
+    });
+    const uploadText = await upload.text().catch(() => "");
+    if (!upload.ok) {
+      return {
+        ok: false,
+        error: `Direkte opplasting feilet med HTTP ${upload.status}`,
+        details: shortText(uploadText, 800),
+        uploadUrlHost: initRes.json.upload?.uploadUrlHost || null
+      };
+    }
+
+    const completeRes = await callProxy("completeSignedUpload", {
+      token: state.accessToken,
+      projectId: state.project.id,
+      projectLocation: state.project.location,
+      parentId,
+      fileName: outName,
+      size,
+      uploadId
+    });
+
+    if (!completeRes.ok || !completeRes.json?.ok) {
+      return {
+        ok: false,
+        error: completeRes.json?.error || `Direkte opplasting ble sendt, men fullføring feilet (HTTP ${completeRes.status})`,
+        details: completeRes.json || shortText(completeRes.text, 800)
+      };
+    }
+
+    return {
+      ...completeRes.json,
+      directUpload: true,
+      uploadUrlHost: initRes.json.upload?.uploadUrlHost || null
+    };
+  }
+
   async function downloadProjectFile(file) {
     const proxyRes = await callProxy("downloadKofFile", {
       token: state.accessToken,
       projectId: state.project.id,
       projectLocation: state.project.location,
       fileId: file.id,
-      fileName: file.name
+      fileName: file.name,
+      signedUrlOnly: /\.ifc$/i.test(String(file.name || ""))
     });
 
     if (!proxyRes.ok || !proxyRes.json) throw new Error(`Proxy svarte med HTTP ${proxyRes.status}`);
     const result = proxyRes.json;
     if (!result.ok) throw new Error(result.error || result.step || `Kunne ikke laste ned ${file.name}`);
+    if (result.downloadUrl && !result.text) {
+      const direct = await fetch(result.downloadUrl);
+      if (!direct.ok) throw new Error(`Direkte nedlasting av ${file.name} feilet med HTTP ${direct.status}`);
+      result.text = await direct.text();
+      result.source = {
+        ...(result.source || {}),
+        mode: "browserSignedUrl",
+        signedUrlHost: result.source?.signedUrlHost || null
+      };
+    }
     return result;
   }
 

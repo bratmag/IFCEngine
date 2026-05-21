@@ -60,6 +60,15 @@
     return classification.includes("stakeout") || method.includes("observation") || method.includes("gps");
   }
 
+  function isDeletedJxlRecord(record, props = {}) {
+    const deleted = directText(record, "Deleted") || props.Deleted || props.deleted || "";
+    const status = directText(record, "Status") || props.Status || "";
+    const notes = directText(record, "Notes") || "";
+    return /^true$/i.test(String(deleted).trim()) ||
+      /deleted|slettet/i.test(String(status)) ||
+      /deleted|slettet/i.test(String(notes));
+  }
+
   function canonicalMeasuredPointName(name, knownNames) {
     const raw = normalizePointName(name);
     const suffix = raw.match(/^(.+?)u$/i);
@@ -81,6 +90,7 @@
 
     for (const record of Array.from(doc.querySelectorAll("*")).filter((node) => localName(node) === "PointRecord")) {
       const props = collectProps(record);
+      if (isDeletedJxlRecord(record, props)) continue;
       const guid = props.GUID || props.IfcGuid || props.IFC_GUID || null;
       const name = normalizePointName(directText(record, "Name") || record.getAttribute("ID"));
       const coord = parseGrid(record);

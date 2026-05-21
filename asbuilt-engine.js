@@ -54,6 +54,19 @@
     return String(name || "").trim();
   }
 
+  function isMeasuredRecord(record) {
+    const classification = String(record?.props?.Classification || record?.classification || "").toLowerCase();
+    const method = String(record?.props?.Method || record?.method || "").toLowerCase();
+    return classification.includes("stakeout") || method.includes("observation") || method.includes("gps");
+  }
+
+  function canonicalMeasuredPointName(name, knownNames) {
+    const raw = normalizePointName(name);
+    const suffix = raw.match(/^(.+?)u$/i);
+    if (suffix && knownNames.has(suffix[1].toLowerCase())) return knownNames.get(suffix[1].toLowerCase());
+    return raw;
+  }
+
   function parseJxl(jxlText) {
     const xml = String(jxlText || "");
     const doc = new DOMParser().parseFromString(xml, "application/xml");
@@ -71,6 +84,8 @@
       const name = normalizePointName(directText(record, "Name") || record.getAttribute("ID"));
       const coord = parseGrid(record);
       if (!guid || !name || !coord) continue;
+      props.Method = directText(record, "Method") || props.Method || "";
+      props.Classification = directText(record, "Classification") || props.Classification || "";
       if (!pointRecordsByGuid.has(guid)) pointRecordsByGuid.set(guid, new Map());
       const byName = pointRecordsByGuid.get(guid);
       if (!byName.has(name)) byName.set(name, []);
@@ -115,11 +130,20 @@
         });
       }
       const object = objects.get(guid);
-      for (const [name, records] of byName.entries()) {
-        const last = records[records.length - 1];
-        if (!object.design[name] && records.length > 1) object.design[name] = records[0].coord;
-        object.measured[name] = last.coord;
-        object.props = { ...object.props, ...last.props };
+      const knownNames = new Map(Array.from(byName.keys()).map((name) => [String(name).toLowerCase(), name]));
+      const grouped = new Map();
+      for (const [rawName, records] of byName.entries()) {
+        const name = canonicalMeasuredPointName(rawName, knownNames);
+        if (!grouped.has(name)) grouped.set(name, []);
+        grouped.get(name).push(...records.map((record) => ({ ...record, rawName })));
+      }
+
+      for (const [name, records] of grouped.entries()) {
+        const design = records.find((record) => !isMeasuredRecord(record)) || (records.length > 1 ? records[0] : null);
+        const measured = [...records].reverse().find((record) => isMeasuredRecord(record)) || records[records.length - 1];
+        if (!object.design[name] && design) object.design[name] = design.coord;
+        object.measured[name] = measured.coord;
+        object.props = { ...object.props, ...measured.props };
         if (!object.pointOrder.includes(name)) object.pointOrder.push(name);
       }
     }

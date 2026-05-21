@@ -7,7 +7,7 @@
     TOKEN_WAIT_MS: 30000,
     PROXY_URL: "/.netlify/functions/tc-proxy",
     APP_TITLE: "IFCEngine",
-    APP_BUILD: "20260521-asbuilt-upload-fallback-restore",
+    APP_BUILD: "20260521-asbuilt-treat-upload-put-as-success",
     JXL_ECEF_NN2000_GEOID_OFFSET_M: 40.3703,
     AUTO_CONVERT_ON_OPEN: false,
     IFC_POINT_OBJECT_HEIGHT_M: 1,
@@ -101,6 +101,9 @@
           ok: !!output.uploadResult.ok,
           skipped: !!output.uploadResult.skipped,
           error: output.uploadResult.error || null,
+          warning: output.uploadResult.warning || null,
+          directUpload: !!output.uploadResult.directUpload,
+          completionUnconfirmed: !!output.uploadResult.completionUnconfirmed,
           status: output.uploadResult.status || null,
           file: output.uploadResult.file ? {
             id: output.uploadResult.file.id,
@@ -1039,10 +1042,15 @@
     });
 
     if (!completeRes.ok || !completeRes.json?.ok) {
+      const warning = completeRes.json?.error || `Direkte opplasting ble sendt, men fullføring kunne ikke bekreftes (HTTP ${completeRes.status})`;
       return {
-        ok: false,
-        error: completeRes.json?.error || `Direkte opplasting ble sendt, men fullføring feilet (HTTP ${completeRes.status})`,
-        details: completeRes.json || shortText(completeRes.text, 800)
+        ok: true,
+        error: null,
+        warning,
+        details: completeRes.json || shortText(completeRes.text, 800),
+        directUpload: true,
+        completionUnconfirmed: true,
+        uploadUrlHost: initRes.json.upload?.uploadUrlHost || null
       };
     }
 

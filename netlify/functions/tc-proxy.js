@@ -1,0 +1,2468 @@
+// netlify/functions/tc-proxy.js
+//
+// Proxy between the KOF2TXT extension and the Trimble Connect API.
+
+exports.handler = async function handler(event) {
+  try {
+    if (event.httpMethod !== "POST") {
+      return jsonResponse(405, { ok: false, error: "Method not allowed" });
+    }
+
+    const body = safeJsonParse(event.body) || {};
+    const { action } = body;
+
+    if (action === "listProjectExplorer") return await handleListProjectExplorer(body);
+    if (action === "listProjectKofFiles") return await handleListProjectKofFiles(body);
+    if (action === "downloadKofFile") return await handleDownloadKofFile(body);
+    if (action === "probeCore") return await handleProbeCore(body);
+    if (action === "uploadConvertedTxt") return await handleUploadConvertedTxt(body);
+    if (action === "uploadWorldFile") return jsonResponse(200, await handleUploadWorldFile(body));
+    if (action === "getFieldDataJxl") return await handleGetFieldDataJxl(body);
+    if (action === "listJxlSources") return await handleListJxlSources(body);
+
+    return jsonResponse(400, { ok: false, error: `Unknown action: ${String(action)}` });
+  } catch (err) {
+    console.error("tc-proxy fatal:", err);
+    return jsonResponse(500, { ok: false, error: err?.message || String(err) });
+  }
+};
+
+function jsonResponse(statusCode, data) {
+  return {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
+    },
+    body: JSON.stringify(data, null, 2)
+  };
+}
+
+function safeJsonParse(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function shortText(text, max = 1200) {
+  if (typeof text !== "string") return text;
+  return text.length > max ? text.slice(0, max) + "..." : text;
+}
+
+function safeHost(url) {
+  try { return new URL(url).host; } catch { return null; }
+}
+
+function md5Base64(buffer) {
+  return require("crypto").createHash("md5").update(buffer).digest("base64");
+}
+
+function isUploadAlreadyCompleted(res) {
+  const text = String(res?.text || "");
+  const details = String(res?.json?.details || res?.json?.message || "");
+  return /file upload already completed/i.test(text) ||
+    /file upload already completed/i.test(details);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let regionCache = null;
+
+async function discoverRegions() {
+  if (regionCache) return regionCache;
+
+  try {
+    const res = await fetch("https://app.connect.trimble.com/tc/api/2.0/regions");
+    if (res.ok) {
+      const data = await res.json();
+      regionCache = data;
+      return data;
+    }
+  } catch (err) {
+    console.error("discoverRegions failed:", err?.message || String(err));
+  }
+
+  return null;
+}
+
+function getCoreBaseUrl(projectLocation) {
+  const loc = String(projectLocation || "").toLowerCase();
+
+  if (loc === "europe") return "https://app21.connect.trimble.com/tc/api/2.0";
+  if (loc === "asia") return "https://app.asia.connect.trimble.com/tc/api/2.0";
+
+  return "https://app.connect.trimble.com/tc/api/2.0";
+}
+
+async function getCoreBaseUrlAsync(projectLocation) {
+  const loc = String(projectLocation || "").toLowerCase();
+  const regions = await discoverRegions();
+
+  if (regions && Array.isArray(regions)) {
+    const match = regions.find((r) => {
+      const id = String(r.id || r.name || r.location || "").toLowerCase();
+      return id === loc || id.includes(loc);
+    });
+
+    if (match) {
+      const tcApi = match["tc-api"] || match.tcApi || match.tc_api;
+      if (tcApi) {
+        return String(tcApi).replace(/\/+$/, "");
+      }
+
+      const rawUrl =
+        match.origin ||
+        match.api ||
+        match.apiOrigin ||
+        match.baseUrl ||
+        match.url;
+
+      if (rawUrl) {
+        const withProtocol = String(rawUrl).startsWith("//")
+          ? `https:${rawUrl}`
+          : String(rawUrl);
+        const base = withProtocol.replace(/\/+$/, "");
+        return base.endsWith("/tc/api/2.0") ? base : `${base}/tc/api/2.0`;
+      }
+    }
+  }
+
+  return getCoreBaseUrl(projectLocation);
+}
+
+async function fetchRaw(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const contentType = res.headers.get("content-type") || "";
+    const text = await res.text();
+    const json = safeJsonParse(text);
+
+    return {
+      url,
+      ok: res.ok,
+      status: res.status,
+      statusText: res.statusText,
+      contentType,
+      text,
+      json
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchJsonWithBearer(url, token) {
+  return fetchRaw(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json"
+    }
+  });
+}
+
+async function fetchWithBearer(url, token, options = {}, timeoutMs = 30000) {
+  return fetchRaw(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      ...(options.headers || {})
+    }
+  }, timeoutMs);
+}
+
+async function fetchFieldDataJson(url, token) {
+  return fetchRaw(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json, text/plain, */*",
+      "x-field-data-viewer-workspace-type": "Survey"
+    }
+  }, 60000);
+}
+
+async function fetchTextNoAuth(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const res = await fetch(url, { method: "GET", signal: controller.signal });
+    const contentType = res.headers.get("content-type") || "";
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const text = decodeSourceBuffer(buffer);
+
+    return {
+      url,
+      ok: res.ok,
+      status: res.status,
+      statusText: res.statusText,
+      contentType,
+      text,
+      json: safeJsonParse(text)
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function decodeSourceBuffer(buffer) {
+  const utf8 = buffer.toString("utf8");
+  return utf8.includes("\uFFFD") ? repairUtf8Mojibake(buffer.toString("latin1")) : utf8;
+}
+
+function repairUtf8Mojibake(text) {
+  return String(text || "")
+    .replace(/\u00c3[\u0098\u02dc]/g, "Ø")
+    .replace(/\u00c3\u00b8/g, "ø")
+    .replace(/\u00c3[\u0085\u2026]/g, "Å")
+    .replace(/\u00c3\u00a5/g, "å")
+    .replace(/\u00c3\u0086/g, "Æ")
+    .replace(/\u00c3\u00a6/g, "æ")
+    .replace(/Ã˜/g, "Ø")
+    .replace(/Ã¸/g, "ø")
+    .replace(/Ã…/g, "Å")
+    .replace(/Ã¥/g, "å")
+    .replace(/Ã†/g, "Æ")
+    .replace(/Ã¦/g, "æ");
+}
+
+function extractPossibleUrl(payload) {
+  if (!payload || typeof payload !== "object") return null;
+
+  const direct =
+    payload.downloadUrl ||
+    payload.downloadURL ||
+    payload.uploadUrl ||
+    payload.url ||
+    payload.href ||
+    payload.link ||
+    payload.signedUrl ||
+    payload.presignedUrl ||
+    payload.preSignedUrl ||
+    payload.data?.downloadUrl ||
+    payload.data?.downloadURL ||
+    payload.data?.uploadUrl ||
+    payload.data?.url ||
+    payload.details?.downloadUrl ||
+    payload.details?.downloadURL ||
+    payload.details?.uploadUrl ||
+    payload.details?.url ||
+    payload.result?.downloadUrl ||
+    payload.result?.downloadURL ||
+    payload.result?.uploadUrl ||
+    payload.result?.url ||
+    null;
+
+  if (direct) return direct;
+
+  if (Array.isArray(payload.contents)) {
+    for (const item of payload.contents) {
+      const nested = extractPossibleUrl(item);
+      if (nested) return nested;
+    }
+  }
+
+  if (Array.isArray(payload.data?.contents)) {
+    for (const item of payload.data.contents) {
+      const nested = extractPossibleUrl(item);
+      if (nested) return nested;
+    }
+  }
+
+  if (Array.isArray(payload.result?.contents)) {
+    for (const item of payload.result.contents) {
+      const nested = extractPossibleUrl(item);
+      if (nested) return nested;
+    }
+  }
+
+  return null;
+}
+
+function extractUploadInfo(payload) {
+  if (!payload || typeof payload !== "object") {
+    return { uploadId: null, uploadUrl: null, completeUrl: null };
+  }
+
+  return {
+    uploadId:
+      payload.uploadId ||
+      payload.id ||
+      payload.data?.uploadId ||
+      payload.data?.id ||
+      payload.result?.uploadId ||
+      payload.result?.id ||
+      null,
+    fileId:
+      payload.fileId ||
+      payload.data?.fileId ||
+      payload.result?.fileId ||
+      null,
+    uploadUrl: extractPossibleUrl(payload),
+    contents:
+      payload.contents ||
+      payload.data?.contents ||
+      payload.result?.contents ||
+      [],
+    completeUrl:
+      payload.completeUrl ||
+      payload.completionUrl ||
+      payload.data?.completeUrl ||
+      payload.data?.completionUrl ||
+      payload.result?.completeUrl ||
+      payload.result?.completionUrl ||
+      null
+  };
+}
+
+async function getFileMetadata({ token, projectLocation, fileId }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const url = `${base}/files/${encodeURIComponent(fileId)}`;
+  const res = await fetchJsonWithBearer(url, token);
+
+  return {
+    ok: res.ok,
+    url,
+    status: res.status,
+    preview: shortText(res.text, 1000),
+    data: res.json
+  };
+}
+
+async function getFileVersions({ token, projectLocation, fileId }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const url = `${base}/files/${encodeURIComponent(fileId)}/versions?tokenThumburl=false`;
+  const res = await fetchJsonWithBearer(url, token);
+
+  return {
+    ok: res.ok,
+    url,
+    status: res.status,
+    preview: shortText(res.text, 1000),
+    data: res.json
+  };
+}
+
+async function tryCoreCandidates({ token, projectLocation, fileId, versionId }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const candidates = [
+    {
+      name: "fs-downloadurl",
+      url: `${base}/files/fs/${encodeURIComponent(fileId)}/downloadurl?versionId=${encodeURIComponent(versionId)}`
+    },
+    {
+      name: "fs-downloadurl-versionId-path",
+      url: `${base}/files/fs/${encodeURIComponent(versionId)}/downloadurl?versionId=${encodeURIComponent(versionId)}`
+    },
+    {
+      name: "blobstore-versionId",
+      url: `${base}/files/${encodeURIComponent(versionId)}/blobstore`
+    },
+    {
+      name: "download-versionId",
+      url: `${base}/files/${encodeURIComponent(versionId)}/download`
+    }
+  ];
+
+  const diagnostics = [];
+
+  for (const candidate of candidates) {
+    try {
+      const res = await fetchJsonWithBearer(candidate.url, token);
+      const signedUrl = extractPossibleUrl(res.json);
+
+      const looksLikeText =
+        typeof res.text === "string" &&
+        res.text.length > 0 &&
+        !res.contentType.includes("application/json") &&
+        !res.contentType.includes("text/html");
+
+      diagnostics.push({
+        name: candidate.name,
+        url: candidate.url,
+        status: res.status,
+        ok: res.ok,
+        foundSignedUrl: !!signedUrl,
+        looksLikeText,
+        preview: shortText(res.text, 300)
+      });
+
+      if (signedUrl) {
+        const fileRes = await fetchTextNoAuth(signedUrl);
+
+        if (fileRes.ok) {
+          return {
+            ok: true,
+            source: candidate.name,
+            mode: "signedUrl",
+            signedUrlHost: safeHost(signedUrl),
+            diagnostics,
+            text: fileRes.text,
+            contentType: fileRes.contentType
+          };
+        }
+
+        diagnostics.push({
+          name: `${candidate.name}-signed-url-fetch`,
+          ok: false,
+          status: fileRes.status,
+          contentType: fileRes.contentType,
+          signedUrlHost: safeHost(signedUrl),
+          preview: shortText(fileRes.text, 300)
+        });
+      }
+
+      if (res.ok && looksLikeText) {
+        return {
+          ok: true,
+          source: candidate.name,
+          mode: "directText",
+          diagnostics,
+          text: res.text,
+          contentType: res.contentType
+        };
+      }
+    } catch (err) {
+      diagnostics.push({
+        name: candidate.name,
+        url: candidate.url,
+        ok: false,
+        error: err?.message || String(err)
+      });
+    }
+  }
+
+  return {
+    ok: false,
+    error: "Fant ingen fungerende download-kandidat.",
+    diagnostics
+  };
+}
+
+async function handleDownloadKofFile(body) {
+  const { token, projectId, projectLocation, fileId, fileName } = body;
+
+  if (!token || !fileId) {
+    return jsonResponse(400, { ok: false, error: "Mangler token eller fileId" });
+  }
+
+  const metadata = await getFileMetadata({ token, projectLocation, fileId });
+  if (!metadata.ok || !metadata.data) {
+    return jsonResponse(200, {
+      ok: false,
+      step: "metadata",
+      project: { id: projectId, location: projectLocation },
+      file: { id: fileId, name: fileName },
+      metadata
+    });
+  }
+
+  const versions = await getFileVersions({ token, projectLocation, fileId });
+  let versionId = metadata.data.versionId || metadata.data.id || fileId;
+
+  if (versions.ok && Array.isArray(versions.data) && versions.data.length > 0) {
+    versionId =
+      versions.data[0]?.versionId ||
+      versions.data[0]?.id ||
+      versions.data[0]?.version?.id ||
+      versionId;
+  }
+
+  const download = await tryCoreCandidates({
+    token,
+    projectLocation,
+    fileId,
+    versionId
+  });
+
+  if (!download.ok) {
+    return jsonResponse(200, {
+      ok: false,
+      step: "download",
+      project: { id: projectId, location: projectLocation },
+      file: {
+        id: metadata.data.id,
+        versionId,
+        name: metadata.data.name || fileName,
+        parentId: metadata.data.parentId || null
+      },
+      download
+    });
+  }
+
+  return jsonResponse(200, {
+    ok: true,
+    project: { id: projectId, location: projectLocation },
+    file: {
+      id: metadata.data.id,
+      versionId,
+      name: metadata.data.name || fileName,
+      parentId: metadata.data.parentId || null
+    },
+    source: {
+      candidate: download.source,
+      mode: download.mode,
+      signedUrlHost: download.signedUrlHost || null
+    },
+    contentType: download.contentType,
+    text: download.text
+  });
+}
+
+async function handleProbeCore(body) {
+  const { token, projectId, projectLocation, fileId, fileName } = body;
+
+  if (!token || !fileId) {
+    return jsonResponse(400, { ok: false, error: "Mangler token eller fileId" });
+  }
+
+  const metadata = await getFileMetadata({ token, projectLocation, fileId });
+  const versions = await getFileVersions({ token, projectLocation, fileId });
+
+  let versionId = metadata.data?.versionId || metadata.data?.id || fileId;
+  if (versions.ok && Array.isArray(versions.data) && versions.data.length > 0) {
+    versionId =
+      versions.data[0]?.versionId ||
+      versions.data[0]?.id ||
+      versions.data[0]?.version?.id ||
+      versionId;
+  }
+
+  const probe = await tryCoreCandidates({
+    token,
+    projectLocation,
+    fileId,
+    versionId
+  });
+
+  return jsonResponse(200, {
+    ok: true,
+    probe: "core",
+    project: { id: projectId, location: projectLocation },
+    file: { id: fileId, name: fileName, versionId },
+    metadata,
+    versions,
+    probeResult: probe
+  });
+}
+
+async function uploadToSignedUrl(uploadUrl, fileBuffer, diagnostics, fileName) {
+  const body = new Uint8Array(fileBuffer);
+  const preferredContentType = /\.xml$/i.test(String(fileName || ""))
+    ? "application/xml; charset=utf-8"
+    : /\.ifc$/i.test(String(fileName || ""))
+      ? "application/x-step; charset=utf-8"
+      : "text/plain; charset=utf-8";
+  const methods = [
+    { method: "PUT", headers: { "Content-Type": preferredContentType } },
+    { method: "PUT", headers: { "Content-Type": "application/octet-stream" } },
+    { method: "PUT", headers: {} },
+    { method: "POST", headers: { "Content-Type": "text/plain; charset=utf-8" } }
+  ];
+
+  for (const candidate of methods) {
+    const res = await fetchRaw(uploadUrl, {
+      method: candidate.method,
+      headers: candidate.headers,
+      body
+    }, 120000);
+
+    diagnostics.push({
+      step: "signed-upload",
+      method: candidate.method,
+      status: res.status,
+      ok: res.ok,
+      host: safeHost(uploadUrl),
+      preview: shortText(res.text, 300)
+    });
+
+    if (res.ok) {
+      return { ok: true, method: candidate.method };
+    }
+  }
+
+  return { ok: false, error: "Ingen signed URL upload-metode fungerte." };
+}
+
+function buildCompleteBodies({ uploadId, uploadInfo, fileBuffer, digest, digestHeader }) {
+  const fileId = uploadInfo?.fileId || null;
+  const contents = Array.isArray(uploadInfo?.contents) ? uploadInfo.contents : [];
+  const content = contents[0] && typeof contents[0] === "object" ? contents[0] : {};
+  const size = fileBuffer.length;
+  const contentWithoutUrl = { ...content };
+  delete contentWithoutUrl.url;
+
+  const contentDigest = {
+    ...contentWithoutUrl,
+    digest: digestHeader,
+    md5: digest,
+    contentMD5: digest,
+    contentMd5: digest,
+    size
+  };
+
+  return [
+    { label: "body-format-single-part-underscore", body: { format: "SINGLE_PART" } },
+    { label: "body-format-single-part-lower", body: { format: "single_part" } },
+    { label: "body-format-singlepart-lower", body: { format: "singlepart" } },
+    { label: "body-format-single-part-camel", body: { format: "singlePart" } },
+    { label: "body-format-single-part-with-upload-id", body: { uploadId, format: "SINGLE_PART" } },
+    { label: "body-format-single-part-with-file-id", body: { fileId, format: "SINGLE_PART" } },
+    { label: "body-type-singlepart-with-file-id", body: { fileId, type: "SINGLEPART" } },
+    { label: "body-file-id-only", body: { fileId } },
+    { label: "body-upload-id-only", body: { uploadId } },
+    { label: "body-digest-fields", body: { digest: digestHeader, md5: digest, contentMD5: digest, size } },
+    { label: "body-file-id-digest-fields", body: { fileId, digest: digestHeader, md5: digest, contentMD5: digest, size } },
+    { label: "body-contents-digest", body: { contents: [contentDigest] } },
+    { label: "body-format-contents-digest", body: { format: "SINGLE_PART", contents: [contentDigest] } },
+    { label: "body-type-contents-digest", body: { type: "SINGLEPART", contents: [contentDigest] } },
+    { label: "body-file-id-contents-digest", body: { fileId, contents: [contentDigest] } },
+    { label: "body-upload-id-contents-digest", body: { uploadId, contents: [contentDigest] } }
+  ].filter((candidate) => {
+    if (candidate.body.fileId === null) return false;
+    return true;
+  });
+}
+
+async function completeUpload({ token, projectLocation, uploadId, completeUrl, uploadInfo, fileBuffer, diagnostics }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const candidates = [];
+  const digest = md5Base64(fileBuffer);
+  const digestHeader = `MD5=${digest}`;
+  const digestHeaderLower = `md5=${digest}`;
+
+  if (completeUrl) {
+    candidates.push({
+      label: "provided-complete-url-digest",
+      url: completeUrl,
+      headers: { Digest: digestHeader },
+      body: undefined
+    });
+  }
+  if (uploadId) {
+    const completePath = `${base}/files/fs/upload/${encodeURIComponent(uploadId)}/complete`;
+
+    for (const bodyCandidate of buildCompleteBodies({ uploadId, uploadInfo, fileBuffer, digest, digestHeader })) {
+      candidates.push({
+        label: `complete-path-${bodyCandidate.label}`,
+        url: completePath,
+        headers: { "Content-Type": "application/json", Digest: digestHeader },
+        body: bodyCandidate.body
+      });
+    }
+
+    candidates.push({
+      label: "complete-path-json-content-type-no-body",
+      url: completePath,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: undefined
+    });
+    candidates.push({
+      label: "complete-path-json-content-type-lower-digest-no-body",
+      url: completePath,
+      headers: { "Content-Type": "application/json", Digest: digestHeaderLower },
+      body: undefined
+    });
+    candidates.push({
+      label: "complete-path-octet-content-type-no-body",
+      url: completePath,
+      headers: { "Content-Type": "application/octet-stream", Digest: digestHeader },
+      body: undefined
+    });
+    candidates.push({
+      label: "complete-path-text-content-type-no-body",
+      url: completePath,
+      headers: { "Content-Type": "text/plain", Digest: digestHeader },
+      body: undefined
+    });
+    candidates.push({
+      label: "complete-path-singlepart-query-no-body",
+      url: `${completePath}?format=SINGLEPART`,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: undefined
+    });
+    candidates.push({
+      label: "complete-path-type-singlepart-query-no-body",
+      url: `${completePath}?type=SINGLEPART`,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: undefined
+    });
+    candidates.push({
+      label: "complete-path-multipart-false-query-no-body",
+      url: `${completePath}?multipart=false`,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: undefined
+    });
+    candidates.push({
+      label: "complete-path-digest-empty-json",
+      url: completePath,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: {}
+    });
+    candidates.push({
+      label: "complete-path-singlepart-body",
+      url: completePath,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: { format: "SINGLEPART" }
+    });
+    candidates.push({
+      label: "complete-path-type-singlepart-body",
+      url: completePath,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: { type: "SINGLEPART" }
+    });
+    candidates.push({
+      label: "complete-path-upload-id-body",
+      url: completePath,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: { uploadId }
+    });
+
+    candidates.push({
+      label: "upload-complete-query",
+      url: `${base}/files/fs/upload/complete?uploadId=${encodeURIComponent(uploadId)}`,
+      headers: { Digest: digestHeader },
+      body: {}
+    });
+    candidates.push({
+      label: "upload-id-root",
+      url: `${base}/files/fs/upload/${encodeURIComponent(uploadId)}`,
+      headers: { Digest: digestHeader },
+      body: {}
+    });
+  }
+
+  for (const candidate of candidates) {
+    const hasBody = candidate.body !== undefined;
+    const res = await fetchWithBearer(candidate.url, token, {
+      method: "POST",
+      headers: candidate.headers || {},
+      body: hasBody ? JSON.stringify(candidate.body) : undefined
+    });
+
+    diagnostics.push({
+      step: "complete-upload",
+      variant: candidate.label,
+      url: candidate.url,
+      status: res.status,
+      ok: res.ok,
+      preview: shortText(res.text, 300)
+    });
+
+    if (res.ok) {
+      return { ok: true, response: res.json || res.text };
+    }
+
+    if (isUploadAlreadyCompleted(res)) {
+      return {
+        ok: true,
+        alreadyCompleted: true,
+        response: {
+          status: "completed",
+          completionState: "already_completed"
+        }
+      };
+    }
+  }
+
+  if (uploadId) {
+    const completePath = `${base}/files/fs/upload/${encodeURIComponent(uploadId)}/complete`;
+    const retryCandidate = candidates.find((candidate) => candidate.label === "complete-path-digest-empty-json") || {
+      label: "complete-path-digest-empty-json",
+      url: completePath,
+      headers: { "Content-Type": "application/json", Digest: digestHeader },
+      body: {}
+    };
+
+    for (const delayMs of [1000, 2500, 5000]) {
+      await sleep(delayMs);
+
+      const res = await fetchWithBearer(retryCandidate.url, token, {
+        method: "POST",
+        headers: retryCandidate.headers || {},
+        body: JSON.stringify(retryCandidate.body || {})
+      });
+
+      diagnostics.push({
+        step: "complete-upload",
+        variant: `${retryCandidate.label}-retry-${delayMs}ms`,
+        url: retryCandidate.url,
+        status: res.status,
+        ok: res.ok,
+        preview: shortText(res.text, 300)
+      });
+
+      if (res.ok) {
+        return { ok: true, response: res.json || res.text };
+      }
+
+      if (isUploadAlreadyCompleted(res)) {
+        return {
+          ok: true,
+          alreadyCompleted: true,
+          response: {
+            status: "completed",
+            completionState: "already_completed"
+          }
+        };
+      }
+    }
+  }
+
+  return { ok: false, error: "Kunne ikke fullføre opplastingen." };
+}
+
+async function tryDirectMultipartUpload({ token, projectLocation, parentId, fileName, fileBuffer }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const uploadTargets = [
+    { url: `${base}/files?parentId=${encodeURIComponent(parentId)}`, mode: "form-data-file" },
+    { url: `${base}/files?parentId=${encodeURIComponent(parentId)}&name=${encodeURIComponent(fileName)}`, mode: "octet-stream-name-query", contentType: "application/octet-stream" },
+    { url: `${base}/files?parentId=${encodeURIComponent(parentId)}&fileName=${encodeURIComponent(fileName)}`, mode: "octet-stream-filename-query", contentType: "application/octet-stream" }
+  ];
+  const diagnostics = [];
+
+  for (const target of uploadTargets) {
+    let body;
+    let headers = {};
+
+    if (target.mode === "form-data-file") {
+      const form = new FormData();
+      form.append("file", new Blob([fileBuffer], { type: "text/plain;charset=utf-8" }), fileName);
+      body = form;
+    } else {
+      body = new Uint8Array(fileBuffer);
+      headers = { "Content-Type": target.contentType };
+    }
+
+    const res = await fetchWithBearer(target.url, token, {
+      method: "POST",
+      headers,
+      body
+    }, 120000);
+
+    diagnostics.push({
+      mode: "direct-multipart",
+      variant: target.mode,
+      url: target.url,
+      status: res.status,
+      ok: res.ok,
+      preview: shortText(res.text, 300)
+    });
+
+    if (res.ok) {
+      return {
+        ok: true,
+        mode: "direct-multipart",
+        diagnostics,
+        response: res.json || res.text
+      };
+    }
+  }
+
+  return { ok: false, mode: "direct-multipart", diagnostics };
+}
+
+async function trySignedUploadFlow({ token, projectLocation, parentId, fileName, fileBuffer }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const endpoints = [
+    {
+      label: "parentId-only",
+      url: `${base}/files/fs/upload?parentId=${encodeURIComponent(parentId)}`,
+      body: { name: fileName }
+    },
+    {
+      label: "parentType-folder-lower",
+      url: `${base}/files/fs/upload?parentId=${encodeURIComponent(parentId)}&parentType=folder`,
+      body: { name: fileName }
+    },
+    {
+      label: "parentType-folder-upper",
+      url: `${base}/files/fs/upload?parentId=${encodeURIComponent(parentId)}&parentType=FOLDER`,
+      body: { name: fileName }
+    },
+    {
+      label: "parentType-projectfile",
+      url: `${base}/files/fs/upload?parentId=${encodeURIComponent(parentId)}&parentType=PROJECT_FILE`,
+      body: { name: fileName }
+    },
+    {
+      label: "folderId-only",
+      url: `${base}/files/fs/upload?folderId=${encodeURIComponent(parentId)}`,
+      body: { name: fileName }
+    },
+    {
+      label: "json-parent-body",
+      url: `${base}/files/fs/upload`,
+      body: { name: fileName, parentId, parentType: "FOLDER" }
+    }
+  ];
+  const diagnostics = [];
+
+  for (const endpoint of endpoints) {
+    const initRes = await fetchWithBearer(endpoint.url, token, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(endpoint.body)
+    });
+
+    diagnostics.push({
+      mode: "signed-init",
+      variant: endpoint.label,
+      url: endpoint.url,
+      status: initRes.status,
+      ok: initRes.ok,
+      preview: shortText(initRes.text, 300)
+    });
+
+    if (!initRes.ok || !initRes.json) continue;
+
+    const uploadInfo = extractUploadInfo(initRes.json);
+    if (!uploadInfo.uploadUrl) continue;
+
+    const uploadRes = await uploadToSignedUrl(uploadInfo.uploadUrl, fileBuffer, diagnostics, fileName);
+    if (!uploadRes.ok) continue;
+
+    if (!uploadInfo.uploadId && !uploadInfo.completeUrl) {
+      return {
+        ok: true,
+        mode: "signed-upload",
+        diagnostics,
+        response: initRes.json
+      };
+    }
+
+    const completeRes = await completeUpload({
+      token,
+      projectLocation,
+      uploadId: uploadInfo.uploadId,
+      completeUrl: uploadInfo.completeUrl,
+      uploadInfo,
+      fileBuffer,
+      diagnostics
+    });
+
+    if (completeRes.ok) {
+      return {
+        ok: true,
+        mode: "signed-upload",
+        diagnostics,
+        response: completeRes.response
+      };
+    }
+  }
+
+  return { ok: false, mode: "signed-upload", diagnostics };
+}
+
+async function handleUploadConvertedTxt(body) {
+  const { token, projectId, projectLocation, parentId, fileName, text } = body;
+
+  if (!token || !projectId || !parentId || !fileName || typeof text !== "string") {
+    return jsonResponse(400, { ok: false, error: "Mangler token, projectId, parentId, fileName eller text" });
+  }
+
+  const fileBuffer = Buffer.from(text, "utf8");
+  const attempts = [];
+
+  const direct = await tryDirectMultipartUpload({
+    token,
+    projectLocation,
+    parentId,
+    fileName,
+    fileBuffer
+  });
+  attempts.push(direct);
+
+  if (direct.ok) {
+    return jsonResponse(200, {
+      ok: true,
+      action: "uploadConvertedTxt",
+      project: { id: projectId, location: projectLocation },
+      upload: {
+        mode: direct.mode,
+        parentId,
+        fileName,
+        size: fileBuffer.length
+      },
+      response: direct.response,
+      diagnostics: direct.diagnostics
+    });
+  }
+
+  const signed = await trySignedUploadFlow({
+    token,
+    projectLocation,
+    parentId,
+    fileName,
+    fileBuffer
+  });
+  attempts.push(signed);
+
+  if (signed.ok) {
+    return jsonResponse(200, {
+      ok: true,
+      action: "uploadConvertedTxt",
+      project: { id: projectId, location: projectLocation },
+      upload: {
+        mode: signed.mode,
+        parentId,
+        fileName,
+        size: fileBuffer.length
+      },
+      response: signed.response,
+      diagnostics: signed.diagnostics
+    });
+  }
+
+  return jsonResponse(200, {
+    ok: false,
+    action: "uploadConvertedTxt",
+    error: "Kunne ikke laste opp den konverterte filen automatisk.",
+    project: { id: projectId, location: projectLocation },
+    upload: {
+      parentId,
+      fileName,
+      size: fileBuffer.length
+    },
+    attempts
+  });
+}
+
+async function handleUploadWorldFile(body) {
+  const { token, projectId, projectLocation, parentId, fileName, text } = body;
+
+  if (!token || !projectId || !parentId || !fileName || typeof text !== "string") {
+    return {
+      ok: false,
+      error: "Mangler token, projectId, parentId, fileName eller text"
+    };
+  }
+
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const fileBuffer = Buffer.from(text, "utf8");
+  const attempts = [];
+  const initUrl = `${base}/files/fs/upload?parentId=${encodeURIComponent(parentId)}&parentType=FOLDER`;
+  const init = await fetchWithBearer(initUrl, token, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ name: fileName })
+  });
+  attempts.push({
+    mode: "signed-init",
+    url: initUrl,
+    ok: init.ok,
+    status: init.status,
+    preview: shortText(init.text, 500)
+  });
+
+  if (!init.ok || !init.json) {
+    return {
+      ok: false,
+      action: "uploadWorldFile",
+      error: "Kunne ikke starte signed upload.",
+      project: { id: projectId, location: projectLocation },
+      upload: { parentId, fileName, size: fileBuffer.length },
+      attempts
+    };
+  }
+
+  const uploadId = init.json.uploadId || init.json.id || init.json.data?.uploadId || init.json.result?.uploadId;
+  const uploadUrl =
+    init.json.contents?.[0]?.url ||
+    init.json.data?.contents?.[0]?.url ||
+    init.json.result?.contents?.[0]?.url ||
+    init.json.uploadUrl ||
+    init.json.url;
+
+  if (!uploadId || !uploadUrl) {
+    return {
+      ok: false,
+      action: "uploadWorldFile",
+      error: "Signed upload manglet uploadId eller uploadUrl.",
+      project: { id: projectId, location: projectLocation },
+      upload: { parentId, fileName, size: fileBuffer.length },
+      attempts
+    };
+  }
+
+  const upload = await fetch(uploadUrl, {
+    method: "PUT",
+    body: new Uint8Array(fileBuffer)
+  });
+  const uploadText = await upload.text();
+  attempts.push({
+    mode: "signed-put",
+    url: uploadUrl,
+    ok: upload.ok,
+    status: upload.status,
+    preview: shortText(uploadText, 500)
+  });
+
+  if (!upload.ok) {
+    return {
+      ok: false,
+      action: "uploadWorldFile",
+      error: "Kunne ikke skrive filinnhold til signed upload URL.",
+      project: { id: projectId, location: projectLocation },
+      upload: { parentId, fileName, size: fileBuffer.length },
+      attempts
+    };
+  }
+
+  const completeUrl = `${base}/files/fs/upload/${encodeURIComponent(uploadId)}/complete`;
+  const digestHeader = `MD5=${md5Base64(fileBuffer)}`;
+  const completeBodies = [
+    { label: "format-singlepart", body: { format: "SINGLEPART" } },
+    { label: "type-singlepart", body: { type: "SINGLEPART" } },
+    { label: "empty-json", body: {} },
+    { label: "no-body", body: undefined }
+  ];
+
+  let finalComplete = null;
+  for (const candidate of completeBodies) {
+    const complete = await fetchWithBearer(completeUrl, token, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Digest: digestHeader
+      },
+      body: candidate.body === undefined ? undefined : JSON.stringify(candidate.body)
+    });
+    finalComplete = complete;
+    attempts.push({
+      mode: `signed-complete-${candidate.label}`,
+      url: completeUrl,
+      ok: complete.ok,
+      status: complete.status,
+      preview: shortText(complete.text, 500)
+    });
+
+    if (complete.ok || isUploadAlreadyCompleted(complete)) {
+      return {
+        ok: true,
+        action: "uploadWorldFile",
+        project: { id: projectId, location: projectLocation },
+        upload: { parentId, fileName, size: fileBuffer.length },
+        complete: complete.json || safeJsonParse(complete.text) || shortText(complete.text, 800),
+        attempts
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    action: "uploadWorldFile",
+    error: "Filinnholdet ble lastet opp, men fullføring feilet.",
+    project: { id: projectId, location: projectLocation },
+    upload: { parentId, fileName, size: fileBuffer.length },
+    complete: finalComplete?.json || safeJsonParse(finalComplete?.text || "") || shortText(finalComplete?.text || "", 800),
+    attempts
+  };
+}
+
+async function handleListProjectKofFiles(body) {
+  const { token, projectId, projectLocation } = body;
+
+  if (!token || !projectId) {
+    return jsonResponse(400, { ok: false, error: "Mangler token eller projectId" });
+  }
+
+  const listResult = await tryListProjectFilesCandidates({
+    token,
+    projectId,
+    projectLocation
+  });
+
+  return jsonResponse(200, listResult);
+}
+
+async function listProjectJxlFiles({ token, projectId, projectLocation }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const diagnostics = [];
+  const url = `${base}/search?projectId=${encodeURIComponent(projectId)}&query=.jxl&type=file`;
+  const res = await fetchJsonWithBearer(url, token);
+  diagnostics.push({
+    name: "search-jxl-sources",
+    url,
+    ok: res.ok,
+    status: res.status,
+    preview: shortText(res.text, 500)
+  });
+
+  const searchFiles = res.ok && res.json
+    ? normalizeFilesFromAnyResponse(res.json)
+        .filter((file) => file?.id && /\.jxl$/i.test(file.name || ""))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" }))
+    : [];
+
+  const seedFolderIds = Array.from(new Set(searchFiles.map((file) => file.parentId).filter(Boolean)));
+  if (seedFolderIds.length) {
+    const folderTree = await tryFolderTreeJxlListing({
+      token,
+      projectLocation,
+      seedFolderIds,
+      initialDiagnostics: diagnostics
+    });
+    return folderTree;
+  }
+
+  const files = searchFiles.filter((file) => !isDeletedFileLike(file));
+  return { ok: files.length > 0, files, diagnostics };
+}
+
+async function tryFolderTreeJxlListing({ token, projectLocation, seedFolderIds = [], initialDiagnostics = [] }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const diagnostics = Array.isArray(initialDiagnostics) ? [...initialDiagnostics] : [];
+  const filesByKey = new Map();
+  const folderQueue = seedFolderIds.map((id) => ({ id, pathParts: [] }));
+  const visitedFolders = new Set();
+
+  while (folderQueue.length) {
+    const current = folderQueue.shift();
+    if (!current?.id || visitedFolders.has(current.id)) continue;
+    visitedFolders.add(current.id);
+
+    const res = await fetchJsonWithBearer(`${base}/folders/${encodeURIComponent(current.id)}/items`, token);
+    diagnostics.push({
+      name: `jxl-folder-items:${current.id}`,
+      url: `${base}/folders/${encodeURIComponent(current.id)}/items`,
+      ok: res.ok,
+      status: res.status,
+      preview: shortText(res.text, 500)
+    });
+    if (!res.ok || !res.json) continue;
+
+    const items = normalizeItemsFromAnyResponse(res.json, current.pathParts);
+    for (const item of items) {
+      if (item.kind === "folder") {
+        folderQueue.push({
+          id: item.id,
+          pathParts: item.name ? [...current.pathParts, item.name] : current.pathParts
+        });
+        continue;
+      }
+      if (!item.id || !/\.jxl$/i.test(item.name || "") || isDeletedFileLike(item)) continue;
+      const key = `${item.id}|${item.parentId || ""}|${item.name}`;
+      if (!filesByKey.has(key)) filesByKey.set(key, item);
+    }
+  }
+
+  const files = Array.from(filesByKey.values()).sort((a, b) =>
+    String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" })
+  );
+  return { ok: files.length > 0, files, diagnostics };
+}
+
+async function listFieldDataJxlJobs({ token, projectId }) {
+  const diagnostics = [];
+  const encodedProjectId = encodeURIComponent(projectId);
+  const url = `https://eu.api.maps.trimblegeospatial.com/projects/${encodedProjectId}/surveyjobs/_query?sortBy=UpdatedUtc+DESC&pageIndex=0&pageSize=1500`;
+  const res = await fetchFieldDataJson(url, token);
+  diagnostics.push({
+    name: "field-data-jxl-sources",
+    url,
+    ok: res.ok,
+    status: res.status,
+    preview: shortText(res.text, 700)
+  });
+
+  if (!res.ok || !res.json) return { ok: false, jobs: [], diagnostics };
+
+  const jobs = (Array.isArray(res.json.items) ? res.json.items : [])
+    .map((job) => ({
+      id: job.id || null,
+      name: job.name || null,
+      updatedUtc: job.updatedUtc || job.UpdatedUtc || job.updatedOn || job.modifiedOn || null,
+      jxlFileName: job.rootDataFileJxl?.fileName || null,
+      jxlFileId: job.rootDataFileJxl?.id || null,
+      size: job.rootDataFileJxl?.size || null,
+      rootDataFileJxl: job.rootDataFileJxl || null
+    }))
+    .filter((job) => job.id);
+
+  const detailedJobs = await enrichFieldDataJxlJobs({ token, projectId, jobs, diagnostics });
+  return { ok: detailedJobs.length > 0, jobs: detailedJobs, diagnostics };
+}
+
+async function handleGetFieldDataJxl(body) {
+  const { token, projectId, projectLocation, jobName, jobTrn, jxlFileId, jxlFileName } = body;
+  const wantedName = String(jobName || "JXL to IFC").trim() || "JXL to IFC";
+
+  if (!token || !projectId) {
+    return jsonResponse(400, { ok: false, error: "Mangler token eller projectId" });
+  }
+
+  const diagnostics = [];
+  const encodedProjectId = encodeURIComponent(projectId);
+  const listUrl = `https://eu.api.maps.trimblegeospatial.com/projects/${encodedProjectId}/surveyjobs/_query?sortBy=UpdatedUtc+DESC&pageIndex=0&pageSize=1500`;
+  const listRes = await fetchFieldDataJson(listUrl, token);
+  diagnostics.push({
+    name: "surveyjobs-query",
+    url: listUrl,
+    ok: listRes.ok,
+    status: listRes.status,
+    preview: shortText(listRes.text, 700)
+  });
+
+  if (!listRes.ok || !listRes.json) {
+    return jsonResponse(200, {
+      ok: false,
+      action: "getFieldDataJxl",
+      error: "Kunne ikke liste Survey Jobs fra Field Data.",
+      diagnostics
+    });
+  }
+
+  const jobs = Array.isArray(listRes.json.items) ? listRes.json.items : [];
+  const normalizedWanted = normalizeFieldDataName(wantedName);
+  const job = jobTrn
+    ? jobs.find((item) => String(item?.id || "") === String(jobTrn))
+    : jobs.find((item) => {
+    const candidates = [
+      item?.name,
+      item?.rootDataFile?.fileName,
+      item?.rootDataFileJxl?.fileName
+    ].filter(Boolean);
+    return candidates.some((value) => normalizeFieldDataName(value).includes(normalizedWanted));
+  }) || jobs.find((item) => normalizeFieldDataName(item?.name || "") === normalizedWanted);
+
+  if (!job?.id) {
+    return jsonResponse(200, {
+      ok: false,
+      action: "getFieldDataJxl",
+      error: `Fant ingen Field Data-jobb som matcher "${wantedName}".`,
+      jobs: jobs.slice(0, 25).map((item) => ({
+        id: item?.id || null,
+        name: item?.name || null,
+        updatedUtc: item?.updatedUtc || item?.UpdatedUtc || null
+      })),
+      diagnostics
+    });
+  }
+
+  const detailUrl = `https://eu.api.maps.trimblegeospatial.com/projects/${encodedProjectId}/surveyjobs/${job.id}?includeAttachments=true`;
+  const detailRes = await fetchFieldDataJson(detailUrl, token);
+  diagnostics.push({
+    name: "surveyjob-detail",
+    url: detailUrl,
+    ok: detailRes.ok,
+    status: detailRes.status,
+    preview: shortText(detailRes.text, 700)
+  });
+
+  if (!detailRes.ok || !detailRes.json) {
+    return jsonResponse(200, {
+      ok: false,
+      action: "getFieldDataJxl",
+      error: "Fant jobben, men kunne ikke hente Field Data job details.",
+      job: { id: job.id, name: job.name || null },
+      diagnostics
+    });
+  }
+
+  const detail = detailRes.json;
+  const jxlCandidates = extractFieldDataJxlFiles(detail);
+  const wantedFileName = normalizeFieldDataName(jxlFileName || "");
+  const wantedFileId = jxlFileId ? String(jxlFileId) : "";
+  const jxlFile =
+    (wantedFileId && jxlCandidates.find((file) => String(file.id || "") === wantedFileId)) ||
+    (wantedFileName && jxlCandidates.find((file) => normalizeFieldDataName(file.fileName || "") === wantedFileName)) ||
+    (!wantedFileId && !wantedFileName ? (jxlCandidates[0] || detail.rootDataFileJxl || null) : null);
+  const downloadUrl = jxlFile?.downloadUrl || null;
+  if (!downloadUrl) {
+    return jsonResponse(200, {
+      ok: false,
+      action: "getFieldDataJxl",
+      error: "Jobben mangler en JXL-fil med downloadUrl.",
+      job: summarizeFieldDataJob(detail),
+      jxlCandidates: jxlCandidates.map((file) => ({
+        id: file.id || null,
+        fileName: file.fileName || null,
+        sourceLabel: file.sourceLabel || null,
+        hasDownloadUrl: Boolean(file.downloadUrl)
+      })),
+      diagnostics
+    });
+  }
+
+  const jxlRes = await fetchTextNoAuth(downloadUrl);
+  diagnostics.push({
+    name: "rootDataFileJxl-download",
+    ok: jxlRes.ok,
+    status: jxlRes.status,
+    contentType: jxlRes.contentType,
+    signedUrlHost: safeHost(downloadUrl),
+    preview: shortText(jxlRes.text, 400)
+  });
+
+  if (!jxlRes.ok) {
+    return jsonResponse(200, {
+      ok: false,
+      action: "getFieldDataJxl",
+      error: "Fant JXL downloadUrl, men nedlasting feilet.",
+      job: summarizeFieldDataJob(detail),
+      diagnostics
+    });
+  }
+
+  const uploadParent = await resolveProjectUploadParent({ token, projectId, projectLocation });
+  diagnostics.push(...uploadParent.diagnostics);
+
+  return jsonResponse(200, {
+    ok: true,
+    action: "getFieldDataJxl",
+    project: { id: projectId, location: projectLocation },
+    job: summarizeFieldDataJob(detail),
+    jxlFile: {
+      id: jxlFile.id || null,
+      fileName: jxlFile.fileName || jxlFile.name || `${wantedName}.jxl`,
+      size: jxlFile.size || jxlRes.text.length,
+      sourceLabel: jxlFile.sourceLabel || null,
+      contentType: jxlRes.contentType
+    },
+    uploadParentId: uploadParent.parentId,
+    uploadParentSource: uploadParent.source,
+    text: jxlRes.text,
+    diagnostics
+  });
+}
+
+async function handleListJxlSources(body) {
+  const { token, projectId, projectLocation } = body;
+  if (!token || !projectId) {
+    return jsonResponse(400, { ok: false, error: "Mangler token eller projectId" });
+  }
+
+  const diagnostics = [];
+  const connect = await listProjectJxlFiles({ token, projectId, projectLocation });
+  diagnostics.push(...connect.diagnostics);
+
+  const fieldData = await listFieldDataJxlJobs({ token, projectId });
+  diagnostics.push(...fieldData.diagnostics);
+
+  const sources = [
+    ...connect.files.map((file) => ({
+      sourceType: "connect-file",
+      id: file.id,
+      name: file.name,
+      path: file.path || "Connect Explorer",
+      modifiedOn: file.modifiedOn || null,
+      file
+    })),
+    ...fieldData.jobs.map((job) => ({
+      sourceType: "field-data",
+      id: job.sourceId || job.id,
+      name: job.jxlFileName || job.name || job.id,
+      path: `Field Data${job.name ? ` / ${job.name}` : ""}${job.sourceLabel ? ` / ${job.sourceLabel}` : ""}`,
+      modifiedOn: job.jxlUpdatedUtc || job.updatedUtc || null,
+      job
+    }))
+  ].sort((a, b) => String(b.modifiedOn || "").localeCompare(String(a.modifiedOn || "")));
+
+  return jsonResponse(200, {
+    ok: connect.ok || fieldData.ok,
+    action: "listJxlSources",
+    project: { id: projectId, location: projectLocation },
+    sources,
+    diagnostics
+  });
+}
+
+async function tryListProjectFilesCandidates({ token, projectId, projectLocation }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const regions = await discoverRegions();
+  const seedDiagnostics = [];
+  const searchFilesByKey = new Map();
+
+  for (const query of [".ifc"]) {
+    const url = `${base}/search?projectId=${encodeURIComponent(projectId)}&query=${encodeURIComponent(query)}&type=file`;
+    const searchProbe = await fetchJsonWithBearer(url, token);
+    const searchFiles = searchProbe.ok && searchProbe.json
+      ? normalizeFilesFromAnyResponse(searchProbe.json).filter((f) => f && f.id && isSourceFileName(f.name))
+      : [];
+
+    for (const file of searchFiles) {
+      const key = `${file.id}|${file.parentId || ""}|${file.name}`;
+      if (!searchFilesByKey.has(key)) searchFilesByKey.set(key, file);
+    }
+
+    seedDiagnostics.push({
+      name: `search-${query.replace(/^\./, "")}-seed`,
+      url,
+      ok: searchProbe.ok,
+      status: searchProbe.status,
+      preview: shortText(searchProbe.text, 400)
+    });
+  }
+
+  const searchFiles = Array.from(searchFilesByKey.values());
+  const seedFolderIds = Array.from(new Set(
+    searchFiles
+      .map((f) => f.parentId || null)
+      .filter(Boolean)
+  ));
+
+  const folderTree = await tryFolderTreeListing({
+    token,
+    projectId,
+    projectLocation,
+    seedFolderIds,
+    initialDiagnostics: seedDiagnostics.map((item) => ({ ...item, seedFolderIds }))
+  });
+
+  if (folderTree.ok && Array.isArray(folderTree.files) && folderTree.files.length) {
+    return {
+      ok: true,
+      action: "listProjectIfcFiles",
+      project: { id: projectId, location: projectLocation },
+      resolvedBaseUrl: base,
+      source: folderTree.source,
+      candidatesTried: folderTree.candidatesTried,
+      files: folderTree.files,
+      convertedFiles: folderTree.convertedFiles || [],
+      diagnostics: folderTree.diagnostics,
+      sources: folderTree.sources
+    };
+  }
+
+  const candidates = [
+    {
+      name: "projects-files-recursive",
+      url: `${base}/projects/${encodeURIComponent(projectId)}/files?recursive=true`
+    },
+    {
+      name: "projects-files",
+      url: `${base}/projects/${encodeURIComponent(projectId)}/files`
+    },
+    {
+      name: "search-ifc",
+      url: `${base}/search?projectId=${encodeURIComponent(projectId)}&query=.ifc&type=file`
+    }
+  ];
+
+  const diagnostics = [];
+  const filesByKey = new Map();
+  const successSources = [];
+
+  for (const candidate of candidates) {
+    try {
+      const res = await fetchJsonWithBearer(candidate.url, token);
+
+      diagnostics.push({
+        name: candidate.name,
+        url: candidate.url,
+        ok: res.ok,
+        status: res.status,
+        preview: shortText(res.text, 400)
+      });
+
+      if (!res.ok || !res.json) continue;
+
+      const files = normalizeFilesFromAnyResponse(res.json)
+        .filter((f) => f && f.id && isSourceFileName(f.name))
+        .sort((a, b) =>
+          String(a.name).localeCompare(String(b.name), undefined, {
+            sensitivity: "base"
+          })
+        );
+
+      if (files.length) {
+        successSources.push({
+          name: candidate.name,
+          fileCount: files.length
+        });
+
+        for (const file of files) {
+          const key = `${file.id}|${file.parentId || ""}|${file.name}`;
+          if (!filesByKey.has(key)) {
+            filesByKey.set(key, file);
+          }
+        }
+      }
+    } catch (err) {
+      diagnostics.push({
+        name: candidate.name,
+        url: candidate.url,
+        ok: false,
+        error: err?.message || String(err)
+      });
+    }
+  }
+
+  const files = Array.from(filesByKey.values()).sort((a, b) =>
+    String(a.name).localeCompare(String(b.name), undefined, {
+      sensitivity: "base"
+    })
+  );
+
+  if (files.length) {
+    return {
+      ok: true,
+      action: "listProjectIfcFiles",
+      project: { id: projectId, location: projectLocation },
+      resolvedBaseUrl: base,
+      source: successSources.map((x) => x.name).join("+"),
+      candidatesTried: diagnostics.length,
+      files,
+      diagnostics,
+      sources: successSources
+    };
+  }
+
+  return {
+    ok: false,
+    action: "listProjectIfcFiles",
+    error: "Fant ingen fungerende kandidat for fillisting, eller ingen .ifc-filer i prosjektet.",
+    project: { id: projectId, location: projectLocation },
+    resolvedBaseUrl: base,
+    regionsDiscovered: regions,
+    candidatesTried: diagnostics.length,
+    diagnostics
+  };
+}
+
+async function handleListProjectExplorer(body) {
+  const { token, projectId, projectLocation } = body;
+  if (!token || !projectId) {
+    return jsonResponse(400, { ok: false, error: "Mangler token eller projectId" });
+  }
+
+  const uploadParent = await resolveProjectUploadParent({ token, projectId, projectLocation });
+  const diagnostics = [...uploadParent.diagnostics];
+  if (!uploadParent.parentId) {
+    return jsonResponse(200, {
+      ok: false,
+      action: "listProjectExplorer",
+      error: "Fant ikke rotmappe for prosjektet.",
+      diagnostics
+    });
+  }
+
+  const explorer = await traverseProjectExplorer({
+    token,
+    projectLocation,
+    rootFolderId: uploadParent.parentId
+  });
+  diagnostics.push(...explorer.diagnostics);
+
+  return jsonResponse(200, {
+    ok: explorer.ok,
+    action: "listProjectExplorer",
+    project: { id: projectId, location: projectLocation },
+    rootFolderId: uploadParent.parentId,
+    rootFolderSource: uploadParent.source,
+    folders: explorer.folders,
+    files: explorer.files,
+    convertedFiles: explorer.convertedFiles,
+    diagnostics
+  });
+}
+
+async function traverseProjectExplorer({ token, projectLocation, rootFolderId }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const diagnostics = [];
+  const foldersById = new Map();
+  const allFilesByKey = new Map();
+  const folderQueue = [{ id: rootFolderId, name: "Prosjekt", parentId: null, pathParts: [] }];
+  const visitedFolders = new Set();
+
+  foldersById.set(rootFolderId, {
+    id: rootFolderId,
+    name: "Prosjekt",
+    parentId: null,
+    path: "",
+    depth: 0
+  });
+
+  while (folderQueue.length) {
+    const current = folderQueue.shift();
+    if (!current?.id || visitedFolders.has(current.id)) continue;
+    visitedFolders.add(current.id);
+
+    const url = `${base}/folders/${encodeURIComponent(current.id)}/items`;
+    const res = await fetchJsonWithBearer(url, token);
+    diagnostics.push({
+      name: `project-explorer-items:${current.id}`,
+      url,
+      ok: res.ok,
+      status: res.status,
+      preview: shortText(res.text, 400)
+    });
+    if (!res.ok || !res.json) continue;
+
+    const items = normalizeItemsFromAnyResponse(res.json, current.pathParts);
+    for (const item of items) {
+      if (item.kind === "folder") {
+        const folder = {
+          id: item.id,
+          name: item.name || "(uten navn)",
+          parentId: item.parentId || current.id,
+          path: item.path || [...current.pathParts, item.name || ""].filter(Boolean).join("/"),
+          depth: current.pathParts.length + 1
+        };
+        if (!foldersById.has(folder.id)) {
+          foldersById.set(folder.id, folder);
+          folderQueue.push({
+            id: folder.id,
+            name: folder.name,
+            parentId: folder.parentId,
+            pathParts: folder.path ? folder.path.split("/").filter(Boolean) : []
+          });
+        }
+        continue;
+      }
+
+      if (!item.id || !item.name) continue;
+      const key = `${item.id}|${item.parentId || current.id}|${item.name}`;
+      if (!allFilesByKey.has(key)) {
+        allFilesByKey.set(key, {
+          ...item,
+          parentId: item.parentId || current.id,
+          path: item.path || current.pathParts.join("/")
+        });
+      }
+    }
+  }
+
+  const allFiles = Array.from(allFilesByKey.values());
+  const convertedFiles = allFiles
+    .filter((item) => isConvertedOutputName(item.name))
+    .map((item) => ({
+      id: item.id,
+      name: item.name,
+      versionId: item.versionId || null,
+      modifiedOn: item.modifiedOn || null,
+      revision: item.revision || null,
+      parentId: item.parentId || null,
+      path: item.path || ""
+    }));
+
+  const files = allFiles.map((file) => ({
+    ...file,
+    convertible: isSourceFileName(file.name),
+    existingOutputs: findExistingConvertedOutputs(file, convertedFiles)
+  })).sort((a, b) =>
+    String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" })
+  );
+
+  const folders = Array.from(foldersById.values()).sort((a, b) =>
+    String(a.path || a.name).localeCompare(String(b.path || b.name), undefined, { sensitivity: "base" })
+  );
+
+  return {
+    ok: folders.length > 0 || files.length > 0,
+    folders,
+    files,
+    convertedFiles,
+    diagnostics
+  };
+}
+
+async function tryFolderTreeListing({ token, projectId, projectLocation, seedFolderIds = [], initialDiagnostics = [] }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const diagnostics = Array.isArray(initialDiagnostics) ? [...initialDiagnostics] : [];
+  const filesByKey = new Map();
+  const allFilesByKey = new Map();
+  const folderQueue = seedFolderIds.map((id) => ({ id, pathParts: [] }));
+  const visitedFolders = new Set();
+  const sources = [];
+
+  if (!folderQueue.length) {
+    return {
+      ok: false,
+      source: "folder-tree",
+      candidatesTried: diagnostics.length,
+      files: [],
+      diagnostics,
+      sources,
+      error: "Fant ingen seed-folderId-er fra eksisterende søkeresultater."
+    };
+  }
+
+  while (folderQueue.length) {
+    const current = folderQueue.shift();
+    if (!current?.id || visitedFolders.has(current.id)) continue;
+    visitedFolders.add(current.id);
+
+    const variants = [
+      {
+        name: "folders-items",
+        url: `${base}/folders/${encodeURIComponent(current.id)}/items`
+      },
+      {
+        name: "folders-items-recursive",
+        url: `${base}/folders/${encodeURIComponent(current.id)}/items?recursive=true`
+      }
+    ];
+
+    let currentItems = [];
+
+    for (const variant of variants) {
+      const res = await fetchJsonWithBearer(variant.url, token);
+      diagnostics.push({
+        name: `${variant.name}:${current.id}`,
+        url: variant.url,
+        ok: res.ok,
+        status: res.status,
+        preview: shortText(res.text, 400)
+      });
+
+      if (!res.ok || !res.json) continue;
+
+      currentItems = normalizeItemsFromAnyResponse(res.json, current.pathParts);
+      if (currentItems.length) {
+        sources.push({
+          name: variant.name,
+          folderId: current.id,
+          itemCount: currentItems.length
+        });
+        break;
+      }
+    }
+
+    for (const item of currentItems) {
+      if (item.kind === "folder") {
+        folderQueue.push({
+          id: item.id,
+          pathParts: item.name ? [...current.pathParts, item.name] : current.pathParts
+        });
+        continue;
+      }
+
+      if (item.id && item.name) {
+        const allKey = `${item.id}|${item.parentId || ""}|${item.name}`;
+        if (!allFilesByKey.has(allKey)) {
+          allFilesByKey.set(allKey, item);
+        }
+      }
+
+      if (!item.id || !isSourceFileName(item.name)) continue;
+
+      const key = `${item.id}|${item.parentId || ""}|${item.name}`;
+      if (!filesByKey.has(key)) {
+        filesByKey.set(key, item);
+      }
+    }
+  }
+
+  const convertedFiles = Array.from(allFilesByKey.values())
+    .filter((item) => isConvertedOutputName(item.name))
+    .map((item) => ({
+      id: item.id,
+      name: item.name,
+      versionId: item.versionId || null,
+      modifiedOn: item.modifiedOn || null,
+      revision: item.revision || null,
+      parentId: item.parentId || null,
+      path: item.path || ""
+    }));
+
+  const files = Array.from(filesByKey.values()).map((file) => ({
+    ...file,
+    existingOutputs: findExistingConvertedOutputs(file, convertedFiles)
+  })).sort((a, b) =>
+    String(a.name).localeCompare(String(b.name), undefined, {
+      sensitivity: "base"
+    })
+  );
+
+  return {
+    ok: files.length > 0,
+    source: "folder-tree",
+    candidatesTried: diagnostics.length,
+    files,
+    convertedFiles,
+    diagnostics,
+    sources
+  };
+}
+
+function isSourceFileName(name) {
+  return /\.ifc$/i.test(String(name || ""));
+}
+
+function isConvertedOutputName(name) {
+  return /\.ifcw$/i.test(String(name || ""));
+}
+
+function outputBaseName(name) {
+  return String(name || "").replace(/\.(ifc|ifcw)$/i, "").toLowerCase();
+}
+
+function findExistingConvertedOutputs(file, convertedFiles) {
+  const fileBase = outputBaseName(file?.name);
+  const parentId = file?.parentId || null;
+
+  return (convertedFiles || []).filter((candidate) =>
+    (candidate.parentId || null) === parentId &&
+    outputBaseName(candidate.name) === fileBase
+  );
+}
+
+async function enrichFieldDataJxlJobs({ token, projectId, jobs, diagnostics }) {
+  const encodedProjectId = encodeURIComponent(projectId);
+  const jobsToInspect = jobs.slice(0, 40);
+  const entriesByKey = new Map();
+
+  await mapWithConcurrency(jobsToInspect, 4, async (job) => {
+    const detailUrl = `https://eu.api.maps.trimblegeospatial.com/projects/${encodedProjectId}/surveyjobs/${job.id}?includeAttachments=true`;
+    const detailRes = await fetchFieldDataJson(detailUrl, token);
+    diagnostics.push({
+      name: `field-data-jxl-detail:${job.name || job.id}`,
+      url: detailUrl,
+      ok: detailRes.ok,
+      status: detailRes.status,
+      preview: shortText(detailRes.text, 500)
+    });
+    if (!detailRes.ok || !detailRes.json) return;
+
+    const detailJob = {
+      ...job,
+      name: detailRes.json.name || job.name,
+      updatedUtc: detailRes.json.updatedUtc || detailRes.json.UpdatedUtc || job.updatedUtc
+    };
+    for (const file of extractFieldDataJxlFiles(detailRes.json)) {
+      addFieldDataJxlEntry(entriesByKey, detailJob, file);
+    }
+  });
+
+  return Array.from(entriesByKey.values()).sort((a, b) =>
+    String(b.jxlUpdatedUtc || b.updatedUtc || "").localeCompare(String(a.jxlUpdatedUtc || a.updatedUtc || ""))
+  );
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const queue = Array.isArray(items) ? items.slice() : [];
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, queue.length || 1)) }, async () => {
+    while (queue.length) {
+      const item = queue.shift();
+      await mapper(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
+function addFieldDataJxlEntry(entriesByKey, job, file) {
+  if (!job?.id || !file?.fileName) return;
+  const key = `${job.id}|${file.id || ""}|${file.fileName}|${file.downloadUrl || ""}`;
+  if (entriesByKey.has(key)) return;
+  entriesByKey.set(key, {
+    id: job.id,
+    sourceId: `${job.id}:${file.id || file.fileName}`,
+    name: job.name || null,
+    updatedUtc: job.updatedUtc || null,
+    jxlFileName: file.fileName,
+    jxlFileId: file.id || null,
+    jxlUpdatedUtc: file.updatedUtc || null,
+    sourceLabel: file.sourceLabel || null,
+    size: file.size || null
+  });
+}
+
+function extractFieldDataJxlFiles(job) {
+  const out = [];
+  const seen = new Set();
+
+  walkFieldDataJxlFiles(job, [], out, seen);
+  return out.sort((a, b) =>
+    String(b.updatedUtc || "").localeCompare(String(a.updatedUtc || "")) ||
+    String(a.fileName || "").localeCompare(String(b.fileName || ""), undefined, { sensitivity: "base" })
+  );
+}
+
+function walkFieldDataJxlFiles(node, pathParts, out, seen) {
+  if (node == null) return;
+  if (Array.isArray(node)) {
+    for (const item of node) walkFieldDataJxlFiles(item, pathParts, out, seen);
+    return;
+  }
+  if (typeof node !== "object") return;
+
+  const file = normalizeFieldDataJxlFile(node, pathParts.join(" / "));
+  addFieldDataJxlFile(out, seen, file);
+
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "rootDataFileJxl") continue;
+    if (value && typeof value === "object") {
+      walkFieldDataJxlFiles(value, pathParts.concat(key), out, seen);
+    }
+  }
+}
+
+function normalizeFieldDataJxlFile(node, sourceLabel) {
+  if (!node || typeof node !== "object") return null;
+  const fileName = node.fileName || node.filename || node.name || node.title || null;
+  if (!/\.jxl$/i.test(String(fileName || ""))) return null;
+
+  const downloadUrl =
+    node.downloadUrl ||
+    node.downloadURL ||
+    node.signedUrl ||
+    node.signedURL ||
+    node.url ||
+    node.href ||
+    null;
+
+  return {
+    id: node.id || node.fileId || node.attachmentId || node.documentId || null,
+    fileName: String(fileName),
+    downloadUrl: downloadUrl ? String(downloadUrl) : null,
+    size: node.size || node.fileSize || node.length || null,
+    updatedUtc: node.updatedUtc || node.UpdatedUtc || node.updatedOn || node.modifiedOn || node.createdUtc || null,
+    sourceLabel: sourceLabel || node.type || node.kind || null
+  };
+}
+
+function addFieldDataJxlFile(out, seen, file) {
+  if (!file?.fileName) return;
+  const key = `${file.id || ""}|${file.fileName}|${file.downloadUrl || ""}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  out.push(file);
+}
+
+function normalizeFieldDataName(value) {
+  return String(value || "")
+    .replace(/\.[a-z0-9]+$/i, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function summarizeFieldDataJob(job) {
+  return {
+    id: job?.id || null,
+    name: job?.name || null,
+    rootDataFile: job?.rootDataFile ? {
+      id: job.rootDataFile.id || null,
+      fileName: job.rootDataFile.fileName || null,
+      size: job.rootDataFile.size || null
+    } : null,
+    rootDataFileJxl: job?.rootDataFileJxl ? {
+      id: job.rootDataFileJxl.id || null,
+      fileName: job.rootDataFileJxl.fileName || null,
+      size: job.rootDataFileJxl.size || null
+    } : null
+  };
+}
+
+async function resolveProjectUploadParent({ token, projectId, projectLocation }) {
+  const base = await getCoreBaseUrlAsync(projectLocation);
+  const diagnostics = [];
+  const candidates = [
+    {
+      name: "project-metadata",
+      url: `${base}/projects/${encodeURIComponent(projectId)}`
+    },
+    {
+      name: "project-folders",
+      url: `${base}/projects/${encodeURIComponent(projectId)}/folders`
+    },
+    {
+      name: "folders-project-query",
+      url: `${base}/folders?projectId=${encodeURIComponent(projectId)}`
+    },
+    {
+      name: "project-root-folder",
+      url: `${base}/projects/${encodeURIComponent(projectId)}/rootfolder`
+    }
+  ];
+
+  for (const candidate of candidates) {
+    const res = await fetchJsonWithBearer(candidate.url, token);
+    diagnostics.push({
+      name: `resolve-upload-parent:${candidate.name}`,
+      url: candidate.url,
+      ok: res.ok,
+      status: res.status,
+      preview: shortText(res.text, 500)
+    });
+    if (!res.ok || !res.json) continue;
+
+    const directId = extractProjectFolderId(res.json);
+    if (directId) {
+      return { parentId: directId, source: candidate.name, diagnostics };
+    }
+
+    const folders = normalizeFoldersFromAnyResponse(res.json);
+    const rootFolder = folders.find((folder) => !folder.parentId) || folders[0];
+    if (rootFolder?.id) {
+      return { parentId: rootFolder.id, source: candidate.name, diagnostics };
+    }
+  }
+
+  return { parentId: null, source: null, diagnostics };
+}
+
+function extractProjectFolderId(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const candidates = [
+    payload.rootId,
+    payload.rootFolderId,
+    payload.rootFolder?.id,
+    payload.root?.id,
+    payload.folderId,
+    payload.folder?.id,
+    payload.data?.rootId,
+    payload.data?.rootFolderId,
+    payload.data?.rootFolder?.id,
+    payload.data?.folderId
+  ].filter(Boolean);
+  return candidates.length ? String(candidates[0]) : null;
+}
+
+function isDeletedFileLike(file) {
+  const text = [
+    file?.deleted,
+    file?.isDeleted,
+    file?.lifeState,
+    file?.status,
+    file?.state
+  ].filter((value) => value != null).join(" ").toLowerCase();
+  return /\b(deleted|removed|trashed|inactive)\b/.test(text) || file?.deleted === true || file?.isDeleted === true;
+}
+
+function normalizeFoldersFromAnyResponse(payload) {
+  const out = [];
+  const seen = new Set();
+  walkFolders(payload, out, seen);
+  return out;
+}
+
+function walkFolders(node, out, seen) {
+  if (node == null) return;
+  if (Array.isArray(node)) {
+    for (const item of node) walkFolders(item, out, seen);
+    return;
+  }
+  if (typeof node !== "object") return;
+
+  const type = String(node.type || node.itemType || node.kind || node.objectType || "").toLowerCase();
+  const hasFolderSignal = type.includes("folder") || node.folderId || node.rootFolderId || node.parentFolderId;
+  const id = node.id || node.folderId || node.rootFolderId || null;
+  const name = node.name || node.title || node.folderName || null;
+  if (id && (hasFolderSignal || name)) {
+    const normalized = {
+      id: String(id),
+      name: name ? String(name) : "",
+      parentId: node.parentId || node.parentFolderId || node.parent?.id || null
+    };
+    const key = `${normalized.id}|${normalized.parentId || ""}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(normalized);
+    }
+  }
+
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object") walkFolders(value, out, seen);
+  }
+}
+
+function normalizePathValue(pathValue) {
+  if (!pathValue) return "";
+  if (typeof pathValue === "string") return pathValue;
+
+  if (Array.isArray(pathValue)) {
+    return pathValue
+      .map((item) => {
+        if (!item) return "";
+        if (typeof item === "string") return item;
+        if (typeof item === "object") return item.name || item.title || item.id || "";
+        return "";
+      })
+      .filter(Boolean)
+      .join("/");
+  }
+
+  if (typeof pathValue === "object") {
+    return pathValue.name || pathValue.title || pathValue.id || "";
+  }
+
+  return String(pathValue);
+}
+
+function normalizeFilesFromAnyResponse(payload) {
+  const out = [];
+  const seen = new Set();
+  walkAny(payload, [], out, seen);
+  return out;
+}
+
+function normalizeItemsFromAnyResponse(payload, basePathParts = []) {
+  const out = [];
+  const seen = new Set();
+  walkAnyItem(payload, basePathParts, out, seen);
+  return out;
+}
+
+function walkAny(node, pathParts, out, seen) {
+  if (node == null) return;
+
+  if (Array.isArray(node)) {
+    for (const item of node) walkAny(item, pathParts, out, seen);
+    return;
+  }
+
+  if (typeof node !== "object") return;
+
+  const details = node.details && typeof node.details === "object"
+    ? node.details
+    : null;
+
+  const effectiveName =
+    node.name ||
+    node.fileName ||
+    node.filename ||
+    node.title ||
+    details?.name ||
+    details?.fileName ||
+    null;
+
+  const effectiveId =
+    node.id ||
+    node.fileId ||
+    node.versionId ||
+    details?.id ||
+    details?.fileId ||
+    null;
+
+  const effectiveParentId =
+    node.parentId ||
+    node.parent?.id ||
+    details?.parentId ||
+    null;
+
+  const effectiveVersionId =
+    node.versionId ||
+    details?.versionId ||
+    null;
+
+  const effectiveModifiedOn =
+    node.modifiedOn ||
+    node.modifiedAt ||
+    node.updatedOn ||
+    node.lastModifiedOn ||
+    node.lastModified ||
+    details?.modifiedOn ||
+    details?.modifiedAt ||
+    details?.updatedOn ||
+    details?.lastModifiedOn ||
+    details?.lastModified ||
+    null;
+
+  const effectiveRevision =
+    node.revision ||
+    node.rev ||
+    details?.revision ||
+    details?.rev ||
+    null;
+
+  const effectivePath =
+    node.path ||
+    node.folderPath ||
+    node.fullPath ||
+    node.location ||
+    details?.path ||
+    null;
+
+  const childPath = effectiveName ? [...pathParts, effectiveName] : pathParts;
+
+  if (effectiveId && effectiveName) {
+    const normalized = {
+      id: String(effectiveId),
+      name: String(effectiveName),
+      versionId: effectiveVersionId ? String(effectiveVersionId) : null,
+      modifiedOn: effectiveModifiedOn ? String(effectiveModifiedOn) : null,
+      revision: effectiveRevision != null ? String(effectiveRevision) : null,
+      parentId: effectiveParentId ? String(effectiveParentId) : null,
+      path: effectivePath ? normalizePathValue(effectivePath) : buildPath(pathParts)
+    };
+
+    const key = `${normalized.id}|${normalized.name}|${normalized.path}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(normalized);
+    }
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    if (
+      key === "parent" ||
+      key === "parents" ||
+      key === "_links" ||
+      key === "links" ||
+      key === "permissions"
+    ) {
+      continue;
+    }
+
+    if (Array.isArray(value) || (value && typeof value === "object")) {
+      walkAny(value, childPath, out, seen);
+    }
+  }
+}
+
+function walkAnyItem(node, pathParts, out, seen) {
+  if (node == null) return;
+
+  if (Array.isArray(node)) {
+    for (const item of node) walkAnyItem(item, pathParts, out, seen);
+    return;
+  }
+
+  if (typeof node !== "object") return;
+
+  const details = node.details && typeof node.details === "object"
+    ? node.details
+    : null;
+
+  const effectiveName =
+    node.name ||
+    node.fileName ||
+    node.filename ||
+    node.title ||
+    details?.name ||
+    details?.fileName ||
+    null;
+
+  const effectiveId =
+    node.id ||
+    node.fileId ||
+    node.versionId ||
+    details?.id ||
+    details?.fileId ||
+    null;
+
+  const rawType =
+    node.type ||
+    node.itemType ||
+    node.kind ||
+    node.objectType ||
+    node.resourceType ||
+    details?.type ||
+    details?.itemType ||
+    null;
+
+  const effectiveParentId =
+    node.parentId ||
+    node.parent?.id ||
+    details?.parentId ||
+    null;
+
+  const effectiveVersionId =
+    node.versionId ||
+    details?.versionId ||
+    null;
+
+  const effectiveModifiedOn =
+    node.modifiedOn ||
+    node.modifiedAt ||
+    node.updatedOn ||
+    node.lastModifiedOn ||
+    node.lastModified ||
+    details?.modifiedOn ||
+    details?.modifiedAt ||
+    details?.updatedOn ||
+    details?.lastModifiedOn ||
+    details?.lastModified ||
+    null;
+
+  const effectiveRevision =
+    node.revision ||
+    node.rev ||
+    details?.revision ||
+    details?.rev ||
+    null;
+
+  const effectivePath =
+    node.path ||
+    node.folderPath ||
+    node.fullPath ||
+    node.location ||
+    details?.path ||
+    null;
+
+  const normalizedKind = normalizeItemKind(rawType, node, details);
+  const childPath = effectiveName ? [...pathParts, effectiveName] : pathParts;
+
+  if (effectiveId && effectiveName && normalizedKind) {
+    const normalized = {
+      id: String(effectiveId),
+      name: String(effectiveName),
+      kind: normalizedKind,
+      versionId: effectiveVersionId ? String(effectiveVersionId) : null,
+      modifiedOn: effectiveModifiedOn ? String(effectiveModifiedOn) : null,
+      revision: effectiveRevision != null ? String(effectiveRevision) : null,
+      parentId: effectiveParentId ? String(effectiveParentId) : null,
+      path: effectivePath ? normalizePathValue(effectivePath) : buildPath(pathParts)
+    };
+
+    const key = `${normalized.id}|${normalized.kind}|${normalized.name}|${normalized.path}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(normalized);
+    }
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    if (
+      key === "parent" ||
+      key === "parents" ||
+      key === "_links" ||
+      key === "links" ||
+      key === "permissions"
+    ) {
+      continue;
+    }
+
+    if (Array.isArray(value) || (value && typeof value === "object")) {
+      walkAnyItem(value, childPath, out, seen);
+    }
+  }
+}
+
+function normalizeItemKind(rawType, node, details) {
+  const value = String(rawType || "").toLowerCase();
+
+  if (
+    value.includes("folder") ||
+    value === "dir" ||
+    value === "directory" ||
+    value === "container"
+  ) {
+    return "folder";
+  }
+
+  if (
+    value.includes("file") ||
+    value.includes("document") ||
+    value.includes("version")
+  ) {
+    return "file";
+  }
+
+  if (node?.hasChildren || details?.hasChildren) return "folder";
+  if (node?.children || details?.children) return "folder";
+  if (node?.size != null || details?.size != null) return "file";
+
+  return null;
+}
+
+function buildPath(parts) {
+  const p = (parts || [])
+    .filter(Boolean)
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+
+  return p.length ? p.join("/") : "";
+}

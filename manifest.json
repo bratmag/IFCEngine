@@ -1,0 +1,8 @@
+{
+  "name": "IFCEngine",
+  "title": "IFCEngine",
+  "icon": "https://ifcengine.netlify.app/icon.png",
+  "url": "https://ifcengine.netlify.app/index.html",
+  "description": "IFC-verktøy for prosjektdata, As built og nullpunkt",
+  "enabled": true
+}

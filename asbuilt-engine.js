@@ -509,8 +509,25 @@
     return { transformed, stats: { type: "line", controlPoints: ordered.join(",") } };
   }
 
+  function coordKey(point) {
+    return point ? point.map((value) => Number(value).toFixed(4)).join("|") : "";
+  }
+
+  function collapseDuplicateDesignPoints(names, design) {
+    const byDesign = new Map();
+    for (const name of names) {
+      const key = coordKey(design[name]);
+      if (!key) continue;
+      byDesign.set(key, name);
+    }
+    return Array.from(byDesign.values());
+  }
+
   function selectTransform(object, brep) {
-    const names = object.pointOrder.filter((name) => object.design[name] && object.measured[name]);
+    const names = collapseDuplicateDesignPoints(
+      object.pointOrder.filter((name) => object.design[name] && object.measured[name]),
+      object.design
+    );
     if (/ToTheLine/i.test(object.stakeoutMethod || object.props.StakeoutMethod || "")) {
       return transformByLine(brep.points, object.design, object.measured, names);
     }

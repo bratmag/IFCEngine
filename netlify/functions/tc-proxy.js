@@ -1123,29 +1123,61 @@ async function handleCompleteSignedUpload(body) {
   const completeUrl = `${base}/files/fs/upload/${encodeURIComponent(uploadId)}/complete`;
   const attempts = [];
   const completeBodies = [
+    { label: "metadata-singlepart", body: { name: fileName, size, parentId, format: "SINGLEPART" } },
+    { label: "metadata-type-singlepart", body: { name: fileName, size, parentId, type: "SINGLEPART" } },
+    { label: "metadata-only", body: { name: fileName, size, parentId } },
     { label: "format-singlepart", body: { format: "SINGLEPART" } },
     { label: "type-singlepart", body: { type: "SINGLEPART" } },
     { label: "empty-json", body: {} },
-    { label: "no-body", body: undefined }
+    { label: "no-body", body: undefined },
+    { label: "singlepart-query-no-body", url: `${completeUrl}?format=SINGLEPART`, body: undefined },
+    { label: "type-singlepart-query-no-body", url: `${completeUrl}?type=SINGLEPART`, body: undefined },
+    { label: "multipart-false-query-no-body", url: `${completeUrl}?multipart=false`, body: undefined }
   ];
 
   for (const candidate of completeBodies) {
     const headers = { "Content-Type": "application/json" };
     if (digest) headers.Digest = digest;
 
-    const complete = await fetchWithBearer(completeUrl, token, {
+    const complete = await fetchWithBearer(candidate.url || completeUrl, token, {
       method: "POST",
       headers,
       body: candidate.body === undefined ? undefined : JSON.stringify(candidate.body)
     });
     attempts.push({
       mode: `signed-complete-${candidate.label}`,
-      url: completeUrl,
+      url: candidate.url || completeUrl,
       ok: complete.ok,
       status: complete.status,
       preview: shortText(complete.text, 500)
     });
 
+    if (complete.ok || isUploadAlreadyCompleted(complete)) {
+      return {
+        ok: true,
+        action: "completeSignedUpload",
+        project: { id: projectId, location: projectLocation },
+        upload: { parentId: parentId || null, fileName: fileName || null, size: size || null, uploadId },
+        complete: complete.json || safeJsonParse(complete.text) || shortText(complete.text, 800),
+        attempts
+      };
+    }
+  }
+
+  for (const delayMs of [1000, 2500, 5000]) {
+    await sleep(delayMs);
+    const complete = await fetchWithBearer(completeUrl, token, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    attempts.push({
+      mode: `signed-complete-empty-json-retry-${delayMs}ms`,
+      url: completeUrl,
+      ok: complete.ok,
+      status: complete.status,
+      preview: shortText(complete.text, 500)
+    });
     if (complete.ok || isUploadAlreadyCompleted(complete)) {
       return {
         ok: true,

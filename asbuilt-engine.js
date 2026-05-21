@@ -318,63 +318,6 @@
     return [nums[0] * lengthScale, nums[1] * lengthScale, nums[2] * lengthScale];
   }
 
-  function directionCoords(entity, fallback) {
-    if (!entity) return fallback;
-    const args = entityArgs(entity, "IFCDIRECTION");
-    const nums = Array.from(args[0].matchAll(/[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?/g)).map((match) => Number(match[0]));
-    if (nums.length < 3) return fallback;
-    return unit([nums[0], nums[1], nums[2]]);
-  }
-
-  function placementLocalToWorld(placement, point) {
-    if (!placement) return point;
-    return add(
-      placement.worldOffset,
-      add(
-        add(mul(placement.xAxis, point[0]), mul(placement.yAxis, point[1])),
-        mul(placement.zAxis, point[2])
-      )
-    );
-  }
-
-  function placementWorldToLocal(placement, point) {
-    if (!placement) return point;
-    const rel = sub(point, placement.worldOffset);
-    return [dot(rel, placement.xAxis), dot(rel, placement.yAxis), dot(rel, placement.zAxis)];
-  }
-
-  function placementInfo(entities, placementId, lengthScale, seen = new Set()) {
-    if (!placementId || seen.has(placementId)) return null;
-    seen.add(placementId);
-    const placement = entities.get(placementId);
-    if (!placement || !entityName(placement).startsWith("IFCLOCALPLACEMENT")) return null;
-
-    const args = entityArgs(placement, "IFCLOCALPLACEMENT");
-    const parentId = refs(args[0])[0] || null;
-    const axisPlacementId = refs(args[1])[0] || null;
-    const axisPlacement = entities.get(axisPlacementId);
-    if (!axisPlacement || !entityName(axisPlacement).startsWith("IFCAXIS2PLACEMENT3D")) return null;
-
-    const axisArgs = entityArgs(axisPlacement, "IFCAXIS2PLACEMENT3D");
-    const locationId = refs(axisArgs[0])[0] || null;
-    const localOffset = pointCoords(entities.get(locationId), lengthScale);
-    const zAxis = directionCoords(entities.get(refs(axisArgs[1])[0]), [0, 0, 1]);
-    const xAxis = projectedAxis(directionCoords(entities.get(refs(axisArgs[2])[0]), [1, 0, 0]), zAxis);
-    const yAxis = cross(zAxis, xAxis);
-    const parent = placementInfo(entities, parentId, lengthScale, seen);
-    const parentOffset = parent?.worldOffset || [0, 0, 0];
-    return {
-      placementId,
-      locationId,
-      localOffset,
-      parentOffset,
-      worldOffset: add(parentOffset, localOffset),
-      xAxis,
-      yAxis,
-      zAxis
-    };
-  }
-
   function extractBrep(ifcText, guid) {
     const entities = parseIfcEntities(ifcText);
     const lengthScale = getIfcLengthScale(entities);
@@ -388,7 +331,6 @@
     if (productId == null) throw new Error(`Fant ikke IFC-objekt med GUID ${guid}.`);
 
     const args = productArgs(entities.get(productId));
-    const placement = placementInfo(entities, refs(args[5] || "")[0], lengthScale);
     const shapeId = refs(args[6] || "")[0];
     const shapeArgs = entityArgs(entities.get(shapeId), "IFCPRODUCTDEFINITIONSHAPE");
     const shapeRepId = refs(shapeArgs[2])[0];
@@ -410,16 +352,11 @@
     }
 
     const points = {};
-    for (const pointId of pointIds) {
-      const localPoint = pointCoords(entities.get(pointId), lengthScale);
-      points[pointId] = placementLocalToWorld(placement, localPoint);
-    }
-    if (placement?.locationId) points[placement.locationId] = placement.worldOffset;
+    for (const pointId of pointIds) points[pointId] = pointCoords(entities.get(pointId), lengthScale);
     return {
       productId,
       points,
       geometryPointIds: Array.from(pointIds),
-      placement,
       lengthScale
     };
   }
@@ -680,23 +617,10 @@
         const brep = extractBrep(output, object.guid);
         const transform = selectTransform(object, brep);
         const transformed = { ...transform.transformed };
-        if (brep.placement?.locationId && transformed[brep.placement.locationId]) {
-          const transformedPlacementWorld = transformed[brep.placement.locationId];
-          transformed[brep.placement.locationId] = sub(transformedPlacementWorld, brep.placement.parentOffset);
-          for (const pointId of brep.geometryPointIds || []) {
-            if (transformed[pointId]) {
-              transformed[pointId] = placementWorldToLocal(
-                { ...brep.placement, worldOffset: transformedPlacementWorld },
-                transformed[pointId]
-              );
-            }
-          }
-        }
         output = replaceCartesianPoints(output, transformed, brep.lengthScale);
         const objectStats = {
           guid: object.guid,
           lengthScale: brep.lengthScale,
-          placement: brep.placement ? "local" : "none",
           ...transform.stats
         };
         try {

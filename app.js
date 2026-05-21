@@ -7,7 +7,7 @@
     TOKEN_WAIT_MS: 30000,
     PROXY_URL: "/.netlify/functions/tc-proxy",
     APP_TITLE: "IFCEngine",
-    APP_BUILD: "20260521-large-ifc-manual-entity-scan",
+    APP_BUILD: "20260521-large-ifc-nonfatal-mmi",
     JXL_ECEF_NN2000_GEOID_OFFSET_M: 40.3703,
     AUTO_CONVERT_ON_OPEN: false,
     IFC_POINT_OBJECT_HEIGHT_M: 1,

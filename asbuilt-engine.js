@@ -502,15 +502,15 @@
   function setProductMmi(ifcText, productGuid, value = "500") {
     const entities = parseIfcEntities(ifcText);
     let productId = null;
+    let nextId = 1;
     for (const [entityId, entity] of entities.entries()) {
+      if (entityId >= nextId) nextId = entityId + 1;
       if (entity.includes(`'${productGuid}'`)) {
         productId = entityId;
-        break;
       }
     }
     if (productId == null) return ifcText;
 
-    let nextId = Math.max(...entities.keys()) + 1;
     const additions = [];
     const replacements = new Map();
 
@@ -584,9 +584,14 @@
         const brep = extractBrep(output, object.guid);
         const transform = selectTransform(object, brep);
         output = replaceCartesianPoints(output, transform.transformed);
-        output = setProductMmi(output, object.guid, "500");
+        const objectStats = { guid: object.guid, ...transform.stats };
+        try {
+          output = setProductMmi(output, object.guid, "500");
+        } catch (err) {
+          objectStats.mmiWarning = err?.message || String(err);
+        }
         transformedGuids.push(object.guid);
-        stats.push({ guid: object.guid, ...transform.stats });
+        stats.push(objectStats);
       } catch (err) {
         errors.push({ guid: object.guid, error: err?.message || String(err) });
       }

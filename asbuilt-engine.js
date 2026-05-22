@@ -400,6 +400,7 @@
     for (const pointId of pointIds) points[pointId] = pointCoords(entities.get(pointId), lengthScale);
     return {
       productId,
+      brepId,
       points,
       geometryPointIds: Array.from(pointIds),
       lengthScale
@@ -666,6 +667,14 @@
     return `'${String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
   }
 
+  function appendIfcAdditions(ifcText, additions) {
+    if (!additions.length) return ifcText;
+    const footer = "ENDSEC;\nEND-ISO-10303-21;";
+    const footerIndex = String(ifcText || "").lastIndexOf("ENDSEC;");
+    if (footerIndex < 0) return `${ifcText}\n${additions.join("\n")}\n`;
+    return `${ifcText.slice(0, footerIndex)}${additions.join("\n")}\n${footer}`;
+  }
+
   function setProductMmi(ifcText, productGuid, value = "500") {
     const entities = parseIfcEntities(ifcText);
     let productId = null;
@@ -723,10 +732,76 @@
       const replacement = replacements.get(id);
       return replacement ? `#${id}= ${replacement};` : line;
     }).join("\n");
-    const footer = "ENDSEC;\nEND-ISO-10303-21;";
-    const footerIndex = replaced.lastIndexOf("ENDSEC;");
-    if (footerIndex < 0) return `${replaced}\n${additions.join("\n")}\n`;
-    return `${replaced.slice(0, footerIndex)}${additions.join("\n")}\n${footer}`;
+    return appendIfcAdditions(replaced, additions);
+  }
+
+  function productBodyItemIds(entities, productId) {
+    const product = entities.get(productId);
+    if (!product) return [];
+    const args = productArgs(product);
+    const shapeId = refs(args[6] || "")[0];
+    if (!shapeId) return [];
+    const shape = entities.get(shapeId);
+    if (!shape || !shape.toUpperCase().startsWith("IFCPRODUCTDEFINITIONSHAPE(")) return [];
+    const shapeArgs = entityArgs(shape, "IFCPRODUCTDEFINITIONSHAPE");
+    const itemIds = [];
+    for (const shapeRepId of refs(shapeArgs[2])) {
+      const shapeRep = entities.get(shapeRepId);
+      if (!shapeRep || !shapeRep.toUpperCase().startsWith("IFCSHAPEREPRESENTATION(")) continue;
+      const shapeRepArgs = entityArgs(shapeRep, "IFCSHAPEREPRESENTATION");
+      refs(shapeRepArgs[3]).forEach((id) => itemIds.push(id));
+    }
+    return Array.from(new Set(itemIds));
+  }
+
+  function setProductColor(ifcText, productGuid, color = { red: 0.12, green: 0.42, blue: 0.18 }) {
+    const entities = parseIfcEntities(ifcText);
+    let productId = null;
+    let nextId = 1;
+    for (const [entityId, entity] of entities.entries()) {
+      if (entityId >= nextId) nextId = entityId + 1;
+      if (entity.includes(`'${productGuid}'`)) productId = entityId;
+    }
+    if (productId == null) return ifcText;
+
+    const itemIds = productBodyItemIds(entities, productId);
+    if (!itemIds.length) return ifcText;
+
+    const colorId = nextId++;
+    const renderingId = nextId++;
+    const styleId = nextId++;
+    const additions = [
+      `#${colorId}= IFCCOLOURRGB('AS BUILT',${ifcNum(color.red)},${ifcNum(color.green)},${ifcNum(color.blue)});`,
+      `#${renderingId}= IFCSURFACESTYLERENDERING(#${colorId},0.,$,$,$,$,$,$,.NOTDEFINED.);`,
+      `#${styleId}= IFCSURFACESTYLE('AS BUILT',.POSITIVE.,(#${renderingId}));`
+    ];
+    const replacements = new Map();
+    const styledItems = new Map();
+
+    for (const [entityId, entity] of entities.entries()) {
+      if (entityId >= nextId) nextId = entityId + 1;
+      if (!entity.toUpperCase().startsWith("IFCSTYLEDITEM(")) continue;
+      const args = entityArgs(entity, "IFCSTYLEDITEM");
+      const styledItemId = refs(args[0])[0];
+      if (!itemIds.includes(styledItemId)) continue;
+      args[1] = `(#${styleId})`;
+      replacements.set(entityId, `IFCSTYLEDITEM(${args.join(",")})`);
+      styledItems.set(styledItemId, entityId);
+    }
+
+    for (const itemId of itemIds) {
+      if (styledItems.has(itemId)) continue;
+      const styledItemId = nextId++;
+      additions.push(`#${styledItemId}= IFCSTYLEDITEM(#${itemId},(#${styleId}),$);`);
+    }
+
+    const replaced = String(ifcText || "").split(/\r?\n/).map((line) => {
+      const id = readEntityLineId(line);
+      if (id == null) return line;
+      const replacement = replacements.get(id);
+      return replacement ? `#${id}= ${replacement};` : line;
+    }).join("\n");
+    return appendIfcAdditions(replaced, additions);
   }
 
   function asBuiltName(originalName) {
@@ -763,6 +838,12 @@
           output = setProductMmi(output, object.guid, "500");
         } catch (err) {
           objectStats.mmiWarning = err?.message || String(err);
+        }
+        try {
+          output = setProductColor(output, object.guid);
+          objectStats.color = "AS BUILT green";
+        } catch (err) {
+          objectStats.colorWarning = err?.message || String(err);
         }
         transformedGuids.push(object.guid);
         stats.push(objectStats);

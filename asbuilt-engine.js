@@ -73,6 +73,8 @@
     const raw = normalizePointName(name);
     const suffix = raw.match(/^(.+?)u$/i);
     if (suffix && knownNames.has(suffix[1].toLowerCase())) return knownNames.get(suffix[1].toLowerCase());
+    const duplicate = raw.match(/^(.+?)\.\d+$/);
+    if (duplicate && knownNames.has(duplicate[1].toLowerCase())) return knownNames.get(duplicate[1].toLowerCase());
     return raw;
   }
 

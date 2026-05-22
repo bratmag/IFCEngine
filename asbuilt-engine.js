@@ -560,6 +560,97 @@
     return { transformed, stats: { type: "affine", controlPoints: controlNames.join(",") } };
   }
 
+  function namedNumber(name) {
+    const match = String(name || "").match(/^(.+?)(\d+)$/u);
+    return match ? { prefix: match[1].toLowerCase(), number: Number(match[2]) } : null;
+  }
+
+  function avgZ(names, design) {
+    return names.reduce((sum, name) => sum + design[name][2], 0) / names.length;
+  }
+
+  function orderedQuad(names, design) {
+    const center = centroid(names.map((name) => design[name]));
+    const ring = [...names].sort((a, b) => {
+      const aa = Math.atan2(design[a][1] - center[1], design[a][0] - center[0]);
+      const bb = Math.atan2(design[b][1] - center[1], design[b][0] - center[0]);
+      return aa - bb;
+    });
+    if (ring.length < 4) return null;
+    return [ring[0], ring[1], ring[3], ring[2]];
+  }
+
+  function solveQuadUv(point, p1, p2, p3) {
+    const a = sub(p2, p1);
+    const b = sub(p3, p1);
+    const rel = sub(point, p1);
+    const aa = dot(a, a), ab = dot(a, b), bb = dot(b, b);
+    const ar = dot(a, rel), br = dot(b, rel);
+    const det = aa * bb - ab * ab;
+    if (Math.abs(det) < 1e-12) throw new Error("Kontrollpunktene er degenererte.");
+    return {
+      u: (ar * bb - br * ab) / det,
+      v: (br * aa - ar * ab) / det
+    };
+  }
+
+  function bilinearPoint(u, v, p1, p2, p3, p4) {
+    return add(
+      add(mul(p1, (1 - u) * (1 - v)), mul(p2, u * (1 - v))),
+      add(mul(p3, (1 - u) * v), mul(p4, u * v))
+    );
+  }
+
+  function transformByNamedPrism(points, design, measured, names) {
+    const groups = new Map();
+    for (const name of names) {
+      const parsed = namedNumber(name);
+      if (!parsed || !design[name] || !measured[name]) continue;
+      if (!groups.has(parsed.prefix)) groups.set(parsed.prefix, []);
+      groups.get(parsed.prefix).push(name);
+    }
+
+    const candidates = Array.from(groups.values()).filter((group) => group.length >= 4);
+    if (candidates.length < 2) return null;
+    candidates.sort((a, b) => avgZ(a, design) - avgZ(b, design));
+    const bottomNames = orderedQuad(candidates[0].slice(0, 4), design);
+    const topNames = orderedQuad(candidates[candidates.length - 1].slice(0, 4), design);
+    if (!bottomNames || !topNames) return null;
+
+    const bottomDesign = bottomNames.map((name) => design[name]);
+    const topDesign = topNames.map((name) => design[name]);
+    const bottomMeasured = bottomNames.map((name) => measured[name]);
+    const topMeasured = topNames.map((name) => measured[name]);
+    const transformed = {};
+
+    for (const [pointId, point] of Object.entries(points)) {
+      const { u, v } = solveQuadUv(point, bottomDesign[0], bottomDesign[1], bottomDesign[2]);
+      const designBottom = bilinearPoint(u, v, bottomDesign[0], bottomDesign[1], bottomDesign[2], bottomDesign[3]);
+      const designTop = bilinearPoint(u, v, topDesign[0], topDesign[1], topDesign[2], topDesign[3]);
+      const vertical = sub(designTop, designBottom);
+      const denom = dot(vertical, vertical) || 1;
+      const w = dot(sub(point, designBottom), vertical) / denom;
+      const measuredBottom = bilinearPoint(u, v, bottomMeasured[0], bottomMeasured[1], bottomMeasured[2], bottomMeasured[3]);
+      const measuredTop = bilinearPoint(u, v, topMeasured[0], topMeasured[1], topMeasured[2], topMeasured[3]);
+      transformed[pointId] = add(mul(measuredBottom, 1 - w), mul(measuredTop, w));
+    }
+
+    const exactControls = new Map([...bottomNames, ...topNames].map((name) => [coordKey(design[name]), measured[name]]));
+    for (const [pointId, point] of Object.entries(points)) {
+      const exact = exactControls.get(coordKey(point));
+      if (exact) transformed[pointId] = exact;
+    }
+
+    return {
+      transformed,
+      stats: {
+        type: "named-prism",
+        bottomControlPoints: bottomNames.join(","),
+        topControlPoints: topNames.join(",")
+      }
+    };
+  }
+
   function transformByLine(points, design, measured, names) {
     const ordered = names.filter((name) => design[name] && measured[name]);
     if (ordered.length < 2) return transformByAxis(points, design, measured, ordered);
@@ -620,6 +711,8 @@
     if (/ToTheLine/i.test(object.stakeoutMethod || object.props.StakeoutMethod || "")) {
       return transformByLine(brep.points, object.design, object.measured, names);
     }
+    const prism = transformByNamedPrism(brep.points, object.design, object.measured, names);
+    if (prism) return prism;
     if (names.length >= 4) {
       try {
         return transformByAffine(brep.points, object.design, object.measured, names);

@@ -69,8 +69,10 @@
       /deleted|slettet/i.test(String(notes));
   }
 
-  function canonicalMeasuredPointName(name, knownNames) {
+  function canonicalMeasuredPointName(name, knownNames, record = null) {
     const raw = normalizePointName(name);
+    const code = normalizePointName(record?.props?.Code || record?.props?.FeatureCode || record?.props?.Kode || "");
+    if (isMeasuredRecord(record) && code && knownNames.has(code.toLowerCase())) return knownNames.get(code.toLowerCase());
     const suffix = raw.match(/^(.+?)u$/i);
     if (suffix && knownNames.has(suffix[1].toLowerCase())) return knownNames.get(suffix[1].toLowerCase());
     const duplicate = raw.match(/^(.+?)\.\d+$/);
@@ -99,6 +101,7 @@
       if (!guid || !name || !coord) continue;
       props.Method = directText(record, "Method") || props.Method || "";
       props.Classification = directText(record, "Classification") || props.Classification || "";
+      props.Code = directText(record, "Code") || directText(record, "FeatureCode") || props.Code || props.Kode || "";
       if (!pointRecordsByGuid.has(guid)) pointRecordsByGuid.set(guid, new Map());
       const byName = pointRecordsByGuid.get(guid);
       if (!byName.has(name)) byName.set(name, []);
@@ -148,9 +151,11 @@
       const knownNames = new Map(Array.from(byName.keys()).map((name) => [String(name).toLowerCase(), name]));
       const grouped = new Map();
       for (const [rawName, records] of byName.entries()) {
-        const name = canonicalMeasuredPointName(rawName, knownNames);
-        if (!grouped.has(name)) grouped.set(name, []);
-        grouped.get(name).push(...records.map((record) => ({ ...record, rawName })));
+        for (const record of records) {
+          const name = canonicalMeasuredPointName(rawName, knownNames, record);
+          if (!grouped.has(name)) grouped.set(name, []);
+          grouped.get(name).push({ ...record, rawName });
+        }
       }
 
       for (const [name, records] of grouped.entries()) {

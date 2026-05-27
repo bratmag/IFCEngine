@@ -656,6 +656,29 @@
     };
   }
 
+  function transformByNamedQuad(points, design, measured, names) {
+    const groups = new Map();
+    for (const name of names) {
+      const parsed = namedNumber(name);
+      if (!parsed || !design[name] || !measured[name]) continue;
+      if (!groups.has(parsed.prefix)) groups.set(parsed.prefix, []);
+      groups.get(parsed.prefix).push(name);
+    }
+
+    const candidates = Array.from(groups.values()).filter((group) => group.length === 4);
+    if (candidates.length !== 1) return null;
+    const quadNames = orderedQuad(candidates[0], design);
+    if (!quadNames) return null;
+    const transform = transformByQuad(points, design, measured, quadNames);
+    return {
+      transformed: transform.transformed,
+      stats: {
+        type: "named-quad",
+        controlPoints: quadNames.join(",")
+      }
+    };
+  }
+
   function transformByLine(points, design, measured, names) {
     const ordered = names.filter((name) => design[name] && measured[name]);
     if (ordered.length < 2) return transformByAxis(points, design, measured, ordered);
@@ -718,6 +741,8 @@
     }
     const prism = transformByNamedPrism(brep.points, object.design, object.measured, names);
     if (prism) return prism;
+    const namedQuad = transformByNamedQuad(brep.points, object.design, object.measured, names);
+    if (namedQuad) return namedQuad;
     if (names.length >= 4) {
       try {
         return transformByAffine(brep.points, object.design, object.measured, names);
